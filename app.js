@@ -1124,3 +1124,54 @@ async function reloadAll() {
   await loadCurrentMonth();
   notify('✓ 已重新載入', 'ok');
 }
+
+// ─── PWA 安裝提示 ────────────────────────────────────────────
+let _deferredPrompt = null;
+
+window.addEventListener('beforeinstallprompt', e => {
+  e.preventDefault();
+  _deferredPrompt = e;
+  // 若使用者沒關閉過，顯示安裝 banner
+  if (!localStorage.getItem('pwa-banner-dismissed')) {
+    setTimeout(() => {
+      document.getElementById('pwa-banner')?.classList.remove('hidden');
+    }, 2000);
+  }
+});
+
+window.addEventListener('appinstalled', () => {
+  _deferredPrompt = null;
+  document.getElementById('pwa-banner')?.classList.add('hidden');
+  notify('✓ App 已安裝！', 'ok');
+});
+
+function triggerInstall() {
+  if (!_deferredPrompt) return;
+  _deferredPrompt.prompt();
+  _deferredPrompt.userChoice.then(r => {
+    _deferredPrompt = null;
+    document.getElementById('pwa-banner')?.classList.add('hidden');
+  });
+}
+
+function dismissBanner() {
+  document.getElementById('pwa-banner')?.classList.add('hidden');
+  localStorage.setItem('pwa-banner-dismissed', '1');
+}
+
+function dismissIosGuide() {
+  document.getElementById('ios-guide')?.classList.add('hidden');
+  localStorage.setItem('ios-guide-dismissed', '1');
+}
+
+// 偵測 iOS 且非 standalone 模式 → 顯示安裝引導
+(function checkIOSInstall() {
+  const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
+  const isStandalone = window.navigator.standalone === true;
+  const dismissed = localStorage.getItem('ios-guide-dismissed');
+  if (isIOS && !isStandalone && !dismissed) {
+    setTimeout(() => {
+      document.getElementById('ios-guide')?.classList.remove('hidden');
+    }, 3000);
+  }
+})();
