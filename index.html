@@ -228,7 +228,8 @@ td.r,th.r{text-align:right}
 <div id="splash">
   <img src="icon-192.png" alt="">
   <h1>信用卡記帳</h1>
-  <p>載入中…</p>
+  <p id="splash-msg">載入中…</p>
+  <button class="btn-mini hidden" id="splash-retry" style="margin-top:16px;background:rgba(255,255,255,.2);color:#fff;padding:8px 16px" onclick="location.reload()">重新載入</button>
 </div>
 
 <!-- LOGIN SCREEN -->
@@ -408,6 +409,6 @@ td.r,th.r{text-align:right}
 <!-- Google APIs -->
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 <script src="https://apis.google.com/js/api.js" async defer></script>
-<script src="app.js?v=1.2"></script>
+<script src="app.js?v=1.3"></script>
 </body>
 </html>

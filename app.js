@@ -4,7 +4,7 @@
 
 const CLIENT_ID = '144262693536-poq7p69eo0aqr3r0onjafrd2f1rfrmg3.apps.googleusercontent.com';
 const SCOPES = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file';
-const APP_VERSION = 'v1.2';
+const APP_VERSION = 'v1.3';
 
 // 銀行/卡片定義（依試算表欄位順序）
 const BANKS_CARDS = [
@@ -83,6 +83,16 @@ let HISTORY_DATA = null; // 6 個月歷史
 
 // ─── 初始化 ──────────────────────────────────────────────────
 let GIS_READY = false, GAPI_READY = false;
+
+// Splash 超時保護：12 秒沒載完就顯示錯誤訊息與重試按鈕
+setTimeout(() => {
+  if (!GIS_READY || !GAPI_READY) {
+    const msg = document.getElementById('splash-msg');
+    const retry = document.getElementById('splash-retry');
+    if (msg) msg.innerHTML = `Google API 載入失敗<br><span style="font-size:11px;opacity:.7">GIS:${GIS_READY?'✓':'✗'} GAPI:${GAPI_READY?'✓':'✗'}</span>`;
+    if (retry) retry.classList.remove('hidden');
+  }
+}, 12000);
 
 function checkReady() {
   if (GIS_READY && GAPI_READY) {
@@ -253,31 +263,137 @@ function openSheet() {
   if (!SHEET_ID) return;
   window.open(`https://docs.google.com/spreadsheets/d/${SHEET_ID}/edit`, '_blank');
 }
-function showAbout() {
-  const isStandalone = window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
-  const hasSW = 'serviceWorker' in navigator && !!navigator.serviceWorker.controller;
-  const hasPrompt = !!window._pwaPrompt;
+async function showAbout() {
+  const modal = document.getElementById('install-guide-modal');
+  const content = document.getElementById('install-guide-content');
+
+  // 立即顯示彈窗，內容稍後填入
+  content.innerHTML = '<div style="text-align:center;padding:20px"><span class="loader"></span> 執行診斷中…</div>';
+  modal.classList.remove('hidden');
+
+  // 收集診斷資料
   const ua = navigator.userAgent;
   let device = '其他';
   if (/iphone|ipad|ipod/i.test(ua)) device = 'iOS';
   else if (/android/i.test(ua)) device = 'Android';
   else if (/win|mac|linux/i.test(ua)) device = '桌面';
 
-  let status;
-  if (isStandalone) status = '✅ 已安裝（standalone 模式）';
-  else if (hasPrompt) status = '🟢 可立即安裝（按「安裝為 App」）';
-  else if (device === 'iOS') status = '🟡 iOS 需手動：分享 → 加入主畫面';
-  else status = '🟡 請從瀏覽器選單手動安裝';
+  let browser = '其他';
+  if (/edg/i.test(ua)) browser = 'Edge';
+  else if (/chrome/i.test(ua)) browser = 'Chrome';
+  else if (/firefox/i.test(ua)) browser = 'Firefox';
+  else if (/safari/i.test(ua)) browser = 'Safari';
+  else if (/samsungbrowser/i.test(ua)) browser = 'Samsung';
 
-  alert(
-    `信用卡記帳 ${APP_VERSION}\n\n` +
-    `─── PWA 狀態 ───\n` +
-    `${status}\n\n` +
-    `裝置：${device}\n` +
-    `Service Worker：${hasSW ? '✓ 已啟動' : '✗ 未啟動'}\n` +
-    `自動安裝事件：${hasPrompt ? '✓ 已捕捉' : '✗ 未觸發'}\n\n` +
-    `直接讀寫 Google 試算表的 PWA 應用\n資料儲存在你自己的 Google Drive`
-  );
+  const isStandalone = window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
+  const hasSWReg = 'serviceWorker' in navigator && !!navigator.serviceWorker.controller;
+  const hasPrompt = !!window._pwaPrompt;
+  const isHTTPS = location.protocol === 'https:' || location.hostname === 'localhost';
+
+  // 測試 manifest 是否可讀取
+  let manifestStatus = '⏳ 檢測中';
+  let manifestError = '';
+  try {
+    const mr = await fetch('manifest.json', {cache: 'no-store'});
+    if (mr.ok) {
+      const mj = await mr.json();
+      const hasIcon192 = mj.icons?.some(i => i.sizes === '192x192');
+      const hasIcon512 = mj.icons?.some(i => i.sizes === '512x512');
+      if (hasIcon192 && hasIcon512) {
+        manifestStatus = '✓ 正常';
+      } else {
+        manifestStatus = '⚠ 圖示宣告不完整';
+      }
+    } else {
+      manifestStatus = `✗ ${mr.status}`;
+    }
+  } catch (e) {
+    manifestStatus = '✗ 讀取失敗';
+    manifestError = String(e.message || e);
+  }
+
+  // 測試圖示是否可讀取
+  const checkIcon = async (path) => {
+    try {
+      const r = await fetch(path, {cache: 'no-store'});
+      return r.ok ? `✓ ${(parseInt(r.headers.get('content-length')||'0')/1024).toFixed(1)}KB` : `✗ ${r.status}`;
+    } catch (e) {
+      return '✗ 讀取失敗';
+    }
+  };
+  const icon192 = await checkIcon('icon-192.png');
+  const icon512 = await checkIcon('icon-512.png');
+
+  // SW 詳細狀態
+  let swDetail = '✗ 未註冊';
+  if ('serviceWorker' in navigator) {
+    try {
+      const reg = await navigator.serviceWorker.getRegistration();
+      if (reg) {
+        if (reg.active) swDetail = '✓ 啟動中';
+        else if (reg.installing) swDetail = '⏳ 安裝中';
+        else if (reg.waiting) swDetail = '⏳ 等待啟用';
+        else swDetail = '⚠ 已註冊但未啟動';
+      }
+    } catch {}
+  }
+
+  // 安裝判斷與建議
+  let suggestion = '';
+  if (isStandalone) {
+    suggestion = `<div style="background:#1a3a25;border:1px solid #1f4a30;color:#4CAF50;padding:10px;border-radius:8px;margin-top:12px">✅ 已成功以 App 模式運行！</div>`;
+  } else if (hasPrompt) {
+    suggestion = `<div style="background:#534AB7;color:#fff;padding:10px;border-radius:8px;margin-top:12px">🟢 可立即安裝<br><button class="btn-mini" style="margin-top:8px;background:#fff;color:#534AB7;font-weight:700" onclick="closeInstallGuide();triggerInstall()">點此安裝</button></div>`;
+  } else if (device === 'iOS') {
+    suggestion = `<div style="background:var(--bg3);padding:10px;border-radius:8px;margin-top:12px;font-size:12px;line-height:1.7">
+      <b>iOS 安裝步驟</b><br>
+      1. 點下方 Safari 工具列 <b style="color:#6B5FE0">分享 ⬆</b><br>
+      2. 選 <b style="color:#6B5FE0">「加入主畫面」</b><br>
+      3. 點右上角 <b style="color:#6B5FE0">「新增」</b>
+    </div>`;
+  } else if (device === 'Android') {
+    suggestion = `<div style="background:var(--bg3);padding:10px;border-radius:8px;margin-top:12px;font-size:12px;line-height:1.7">
+      <b>Android Chrome 安裝步驟</b><br>
+      1. 點 Chrome 右上角 <b style="color:#6B5FE0">⋮</b>（不是 App 的 ☰）<br>
+      2. 找 <b style="color:#6B5FE0">「安裝應用程式」</b>← 真正的 PWA<br>
+      ❌ 不要點「新增至主畫面」← 那只是書籤<br>
+      <br>
+      <b style="color:#FFD54F">⚠ 若選單只有「新增至主畫面」沒有「安裝應用程式」</b><br>
+      代表 Chrome 還未判定可安裝，請：<br>
+      ① 在頁面互動 30 秒以上後再試<br>
+      ② 或開無痕視窗試（會繞過拒絕記錄）<br>
+      ③ 或長按之前桌面圖示移除，再重來
+    </div>`;
+  }
+
+  content.innerHTML = `
+    <div style="font-size:13px;line-height:1.8">
+      <div style="background:var(--bg3);padding:10px 12px;border-radius:8px;margin-bottom:10px">
+        <div style="font-weight:700;font-size:14px;color:var(--fg)">信用卡記帳 ${APP_VERSION}</div>
+        <div style="font-size:11px;color:var(--fg3);margin-top:2px">PWA 診斷工具</div>
+      </div>
+
+      <div style="font-weight:600;color:var(--fg2);margin:8px 0 4px">執行環境</div>
+      <table style="font-size:12px">
+        <tr><td>裝置</td><td class="r">${device}</td></tr>
+        <tr><td>瀏覽器</td><td class="r">${browser}</td></tr>
+        <tr><td>HTTPS</td><td class="r">${isHTTPS?'✓':'✗ 必要！'}</td></tr>
+        <tr><td>顯示模式</td><td class="r">${isStandalone?'✓ Standalone':'瀏覽器內'}</td></tr>
+      </table>
+
+      <div style="font-weight:600;color:var(--fg2);margin:10px 0 4px">PWA 檔案檢查</div>
+      <table style="font-size:12px">
+        <tr><td>manifest.json</td><td class="r">${manifestStatus}</td></tr>
+        <tr><td>icon-192.png</td><td class="r">${icon192}</td></tr>
+        <tr><td>icon-512.png</td><td class="r">${icon512}</td></tr>
+        <tr><td>Service Worker</td><td class="r">${swDetail}</td></tr>
+        <tr><td>自動安裝事件</td><td class="r">${hasPrompt?'✓ 已捕捉':'✗ 未觸發'}</td></tr>
+      </table>
+      ${manifestError ? `<div style="color:var(--red);font-size:11px;margin-top:6px">錯誤：${escapeHtml(manifestError)}</div>` : ''}
+
+      ${suggestion}
+    </div>
+  `;
 }
 
 // ─── 主程式啟動 ─────────────────────────────────────────────
