@@ -350,7 +350,7 @@ td.r,th.r{text-align:right}
     <div class="modal-handle"></div>
     <h2>選單</h2>
     <div style="display:flex;flex-direction:column;gap:8px">
-      <button class="btn btn-primary btn-full" id="menu-install-btn" onclick="closeMenu();triggerInstall()" style="display:none">📲 安裝為 App</button>
+      <button class="btn btn-primary btn-full" id="menu-install-btn" onclick="closeMenu();handleInstallClick()" style="display:none">📲 安裝為 App（加入主畫面）</button>
       <button class="btn btn-ghost btn-full" onclick="closeMenu();openSheet()">📊 開啟 Google 試算表</button>
       <button class="btn btn-ghost btn-full" onclick="closeMenu();reloadAll()">🔄 重新載入資料</button>
       <button class="btn btn-ghost btn-full" onclick="closeMenu();openSetupAgain()">⚙ 變更試算表</button>
@@ -381,15 +381,26 @@ td.r,th.r{text-align:right}
   <div class="ios-steps">
     <div class="ios-step">
       <div class="ios-step-num">1</div>
-      <span>點下方工具列的 <b style="color:#6B5FE0">分享</b> 按鈕（方塊+箭頭圖示）</span>
+      <span>點下方工具列的 <b style="color:#6B5FE0">分享</b> 按鈕（方塊+箭頭）</span>
     </div>
     <div class="ios-step">
       <div class="ios-step-num">2</div>
-      <span>在選單中找到 <b style="color:#6B5FE0">「加入主畫面」</b></span>
+      <span>選單中找 <b style="color:#6B5FE0">「加入主畫面」</b></span>
     </div>
     <div class="ios-step">
       <div class="ios-step-num">3</div>
-      <span>點右上角 <b style="color:#6B5FE0">「新增」</b> 完成安裝</span>
+      <span>點右上角 <b style="color:#6B5FE0">「新增」</b> 完成</span>
+    </div>
+  </div>
+</div>
+
+<!-- Manual Install Guide Modal (Android & 其他) -->
+<div class="modal-overlay hidden center" id="install-guide-modal" onclick="if(event.target===this)closeInstallGuide()">
+  <div class="modal">
+    <h2>📲 安裝為 App</h2>
+    <div id="install-guide-content"></div>
+    <div class="btn-row">
+      <button class="btn btn-primary btn-full" onclick="closeInstallGuide()">我知道了</button>
     </div>
   </div>
 </div>

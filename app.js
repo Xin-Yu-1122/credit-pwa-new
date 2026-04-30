@@ -254,7 +254,30 @@ function openSheet() {
   window.open(`https://docs.google.com/spreadsheets/d/${SHEET_ID}/edit`, '_blank');
 }
 function showAbout() {
-  alert(`信用卡記帳 ${APP_VERSION}\n\n直接讀寫 Google 試算表的 PWA 應用\n資料儲存在你自己的 Google Drive`);
+  const isStandalone = window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
+  const hasSW = 'serviceWorker' in navigator && !!navigator.serviceWorker.controller;
+  const hasPrompt = !!window._pwaPrompt;
+  const ua = navigator.userAgent;
+  let device = '其他';
+  if (/iphone|ipad|ipod/i.test(ua)) device = 'iOS';
+  else if (/android/i.test(ua)) device = 'Android';
+  else if (/win|mac|linux/i.test(ua)) device = '桌面';
+
+  let status;
+  if (isStandalone) status = '✅ 已安裝（standalone 模式）';
+  else if (hasPrompt) status = '🟢 可立即安裝（按「安裝為 App」）';
+  else if (device === 'iOS') status = '🟡 iOS 需手動：分享 → 加入主畫面';
+  else status = '🟡 請從瀏覽器選單手動安裝';
+
+  alert(
+    `信用卡記帳 ${APP_VERSION}\n\n` +
+    `─── PWA 狀態 ───\n` +
+    `${status}\n\n` +
+    `裝置：${device}\n` +
+    `Service Worker：${hasSW ? '✓ 已啟動' : '✗ 未啟動'}\n` +
+    `自動安裝事件：${hasPrompt ? '✓ 已捕捉' : '✗ 未觸發'}\n\n` +
+    `直接讀寫 Google 試算表的 PWA 應用\n資料儲存在你自己的 Google Drive`
+  );
 }
 
 // ─── 主程式啟動 ─────────────────────────────────────────────
@@ -1114,11 +1137,11 @@ function notify(msg, type='') {
 
 // 選單
 function openMenu() {
-  // 若有安裝 prompt 可用，在選單顯示安裝按鈕
+  // 安裝按鈕：只要不在 standalone 模式都顯示（不論是否有 _pwaPrompt）
   const installBtn = document.getElementById('menu-install-btn');
   if (installBtn) {
-    const isStandalone = window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone;
-    installBtn.style.display = (window._pwaPrompt && !isStandalone) ? '' : 'none';
+    const isStandalone = window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
+    installBtn.style.display = isStandalone ? 'none' : '';
   }
   document.getElementById('menu-modal').classList.remove('hidden');
 }
@@ -1161,6 +1184,82 @@ function triggerInstall() {
     document.getElementById('pwa-banner')?.classList.add('hidden');
     if (r.outcome === 'accepted') notify('✓ App 已安裝！', 'ok');
   });
+}
+
+// 點選單裡的安裝按鈕：能用 prompt 就用，不能就顯示手動步驟
+function handleInstallClick() {
+  if (window._pwaPrompt) {
+    triggerInstall();
+    return;
+  }
+  // 沒有 prompt 可用 → 顯示手動安裝指引
+  showManualInstallGuide();
+}
+
+function showManualInstallGuide() {
+  const ua = navigator.userAgent;
+  const isIOS = /iphone|ipad|ipod/i.test(ua);
+  const isAndroid = /android/i.test(ua);
+  const isSamsung = /samsungbrowser/i.test(ua);
+  const isFirefox = /firefox/i.test(ua);
+
+  let html = '';
+  if (isIOS) {
+    html = `
+      <div class="setup-info" style="margin-top:0">
+        <p style="margin-bottom:10px">📱 <b>iPhone / iPad（Safari）</b></p>
+        <div class="ios-steps">
+          <div class="ios-step"><div class="ios-step-num">1</div><span>點下方 <b style="color:#6B5FE0">分享</b> 按鈕（方塊+箭頭）</span></div>
+          <div class="ios-step" style="margin-top:8px"><div class="ios-step-num">2</div><span>選 <b style="color:#6B5FE0">「加入主畫面」</b></span></div>
+          <div class="ios-step" style="margin-top:8px"><div class="ios-step-num">3</div><span>點右上角 <b style="color:#6B5FE0">「新增」</b></span></div>
+        </div>
+      </div>`;
+  } else if (isFirefox) {
+    html = `
+      <div class="setup-info" style="margin-top:0">
+        <p style="margin-bottom:10px">🦊 <b>Firefox</b></p>
+        <div class="ios-steps">
+          <div class="ios-step"><div class="ios-step-num">1</div><span>點右上角 <b style="color:#6B5FE0">⋮</b> 選單</span></div>
+          <div class="ios-step" style="margin-top:8px"><div class="ios-step-num">2</div><span>選 <b style="color:#6B5FE0">「安裝」</b> 或 <b style="color:#6B5FE0">「加到主畫面」</b></span></div>
+        </div>
+      </div>`;
+  } else if (isSamsung) {
+    html = `
+      <div class="setup-info" style="margin-top:0">
+        <p style="margin-bottom:10px">📱 <b>Samsung Internet</b></p>
+        <div class="ios-steps">
+          <div class="ios-step"><div class="ios-step-num">1</div><span>點下方 <b style="color:#6B5FE0">≡</b> 選單</span></div>
+          <div class="ios-step" style="margin-top:8px"><div class="ios-step-num">2</div><span>選 <b style="color:#6B5FE0">「將頁面新增至」</b> → <b style="color:#6B5FE0">「主畫面」</b></span></div>
+        </div>
+      </div>`;
+  } else if (isAndroid) {
+    html = `
+      <div class="setup-info" style="margin-top:0">
+        <p style="margin-bottom:10px">🤖 <b>Android Chrome</b></p>
+        <div class="ios-steps">
+          <div class="ios-step"><div class="ios-step-num">1</div><span>點 Chrome 右上角 <b style="color:#6B5FE0">⋮</b> 三點選單</span></div>
+          <div class="ios-step" style="margin-top:8px"><div class="ios-step-num">2</div><span>找 <b style="color:#6B5FE0">「安裝應用程式」</b> 或 <b style="color:#6B5FE0">「新增至主畫面」</b></span></div>
+          <div class="ios-step" style="margin-top:8px"><div class="ios-step-num">3</div><span>點 <b style="color:#6B5FE0">「安裝」</b> 完成</span></div>
+        </div>
+        <p style="margin-top:12px;font-size:11px;color:var(--fg3)">💡 找不到選項時：在頁面停留 30 秒以上、捲動互動後再試一次</p>
+      </div>`;
+  } else {
+    html = `
+      <div class="setup-info" style="margin-top:0">
+        <p style="margin-bottom:10px">💻 <b>桌面瀏覽器</b></p>
+        <div class="ios-steps">
+          <div class="ios-step"><div class="ios-step-num">1</div><span>網址列右側應有 <b style="color:#6B5FE0">⊕</b> 安裝圖示</span></div>
+          <div class="ios-step" style="margin-top:8px"><div class="ios-step-num">2</div><span>或從瀏覽器選單找「安裝」選項</span></div>
+        </div>
+      </div>`;
+  }
+
+  document.getElementById('install-guide-content').innerHTML = html;
+  document.getElementById('install-guide-modal').classList.remove('hidden');
+}
+
+function closeInstallGuide() {
+  document.getElementById('install-guide-modal').classList.add('hidden');
 }
 
 function dismissBanner() {
