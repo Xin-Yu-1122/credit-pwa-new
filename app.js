@@ -4,7 +4,7 @@
 
 const CLIENT_ID = '144262693536-poq7p69eo0aqr3r0onjafrd2f1rfrmg3.apps.googleusercontent.com';
 const SCOPES = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file';
-const APP_VERSION = 'v1.6';
+const APP_VERSION = 'v1.7';
 
 // 9 個銀行（用於儀表板顯示與計算）
 // totalCol = 該銀行總計欄(row 56)；paidCol/accBalCol = 在 row 57 該銀行的「已匯入」「帳戶餘額」位置
@@ -81,6 +81,10 @@ let CATEGORIES = [
   {name:'其他', essential:false},
 ];
 
+// 消費分析分類顏色
+const ESS_COLORS  = ['#534AB7','#7F77DD','#AFA9EC','#185FA5','#378ADD','#85B7EB','#B5D4F4','#3C3489'];
+const NESS_COLORS = ['#D85A30','#EF9F27','#BA7517','#993556','#D4537E','#F09595','#FAC775','#F5C4B3'];
+
 // 全域狀態
 let SHEET_ID = '';
 let TOKEN = null;
@@ -92,6 +96,12 @@ let MONTH_DATA = {}; // {cardKey: [{rowIdx, date, amount, note, category, instal
 let BANK_DATA = {};  // {bankKey: {total, rebate, install, paid, accBalRaw, accBal, net, pending, isPaidCheck}}
 let EDIT_TARGET = null; // {bankKey(=cardKey), rowIdx} for editing
 let HISTORY_DATA = null; // 6 個月歷史
+
+// 圖表實例（切換主題前先 destroy）
+let pieChartInstance = null;
+let trendChartInstance = null;
+let TREND_CACHE = null;        // 趨勢資料快取（避免切月份重複抓）
+let currentAnalysisTab = 0;    // 0=消費分析, 1=歷史趨勢
 
 // ─── 初始化 ──────────────────────────────────────────────────
 let GIS_READY = false, GAPI_READY = false;
@@ -770,7 +780,6 @@ function switchTab(tab) {
 function renderTab() {
   if (CURRENT_TAB === 'dashboard') renderDashboard();
   else if (CURRENT_TAB === 'analysis') renderAnalysis();
-  else if (CURRENT_TAB === 'trends') renderTrends();
 }
 
 // ─── 計算函式 ────────────────────────────────────────────────
@@ -1114,232 +1123,358 @@ async function syncCommonFood(srcRow, date, amount, note, monthOverride) {
   }
 }
 
-// ─── 消費分析 ────────────────────────────────────────────────
+// ─── 消費分析（含子頁籤：消費分析 / 歷史趨勢）──────────────
 function renderAnalysis() {
-  // 收集所有消費（排除「其他代墊」）
-  const allItems = [];
-  Object.keys(MONTH_DATA).forEach(bankKey => {
-    (MONTH_DATA[bankKey] || []).forEach(it => {
-      if (it.category === '其他代墊') return;
-      allItems.push({...it, bankKey});
+  const isLight = document.documentElement.classList.contains('light');
+  const wrap = document.getElementById('tab-content');
+  // 渲染子頁籤框架 + 兩個面板
+  wrap.innerHTML = `
+    <div class="sub-tab-bar">
+      <button class="sub-tab-btn ${currentAnalysisTab===0?'active':''}" onclick="switchAnalysisTab(0)">消費分析</button>
+      <button class="sub-tab-btn ${currentAnalysisTab===1?'active':''}" onclick="switchAnalysisTab(1)">歷史趨勢</button>
+    </div>
+    <div id="analysis-pie-panel" ${currentAnalysisTab===1?'style="display:none"':''}></div>
+    <div id="analysis-trend-panel" ${currentAnalysisTab===0?'style="display:none"':''}></div>
+  `;
+  if (currentAnalysisTab === 0) {
+    renderPieContent();
+  } else {
+    renderTrends();
+  }
+}
+
+function switchAnalysisTab(idx) {
+  currentAnalysisTab = idx;
+  document.querySelectorAll('.sub-tab-btn').forEach((b,i) => b.classList.toggle('active', i===idx));
+  const pie = document.getElementById('analysis-pie-panel');
+  const trend = document.getElementById('analysis-trend-panel');
+  if (pie) pie.style.display = idx===0 ? '' : 'none';
+  if (trend) trend.style.display = idx===1 ? '' : 'none';
+  if (idx === 1) renderTrends();
+  else renderPieContent();
+}
+
+// ─── 消費分析圖表（Chart.js 雙層甜甜圈）────────────────────
+function renderPieContent() {
+  const panel = document.getElementById('analysis-pie-panel');
+  if (!panel) return;
+
+  // 收集所有消費（排除「其他代墊」，負數也計入）
+  const catMap = {};
+  Object.values(MONTH_DATA).forEach(items => {
+    (items || []).forEach(it => {
+      if (it.category === '其他代墊' || it.amount === 0) return;
+      const cat = it.category || '其他';
+      catMap[cat] = (catMap[cat] || 0) + it.amount;
     });
   });
 
-  if (!allItems.length) {
-    document.getElementById('tab-content').innerHTML = `<div class="empty"><div class="empty-icon">📊</div><p>本月還沒有資料可分析</p></div>`;
+  // 過濾淨額 <= 0 的分類（退款後淨負數不顯示）
+  const essSet = new Set(CATEGORIES.filter(c => c.essential).map(c => c.name));
+  let essItems = [], nessItems = [];
+  let essTotal = 0, nessTotal = 0;
+
+  Object.entries(catMap).forEach(([cat, amt]) => {
+    if (amt <= 0) return;
+    if (essSet.has(cat)) {
+      essItems.push({name: cat, amount: amt});
+      essTotal += amt;
+    } else {
+      // 未知分類歸入非必須
+      nessItems.push({name: cat, amount: amt});
+      nessTotal += amt;
+    }
+  });
+
+  if (!essItems.length && !nessItems.length) {
+    panel.innerHTML = `<div class="empty"><div class="empty-icon">📊</div><p>本月還沒有資料可分析</p></div>`;
     return;
   }
 
-  // 必須 vs 非必須
-  let mustTotal = 0, notMustTotal = 0;
-  const catTotals = {};
-  allItems.forEach(it => {
-    if (!catTotals[it.category]) catTotals[it.category] = 0;
-    catTotals[it.category] += it.amount;
-    const c = CATEGORIES.find(x => x.name === it.category);
-    if (c?.essential) mustTotal += it.amount;
-    else notMustTotal += it.amount;
-  });
-  const grandTotal = mustTotal + notMustTotal;
+  // 金額由大到小排序
+  essItems.sort((a, b) => b.amount - a.amount);
+  nessItems.sort((a, b) => b.amount - a.amount);
 
-  let h = '<div class="chart-wrap">';
-  h += '<div class="chart-title">必須 vs 非必須</div>';
-  h += '<div class="donut-wrap"><canvas id="donut1" width="200" height="200"></canvas></div>';
-  h += `<div class="legend">
-    <div class="legend-item"><span class="legend-dot" style="background:#5B9BD5"></span>必須 ${fmtMoney(mustTotal)} (${pct(mustTotal,grandTotal)}%)</div>
-    <div class="legend-item"><span class="legend-dot" style="background:#FF9900"></span>非必須 ${fmtMoney(notMustTotal)} (${pct(notMustTotal,grandTotal)}%)</div>
+  const grandTotal = essTotal + nessTotal;
+  const essPct  = grandTotal > 0 ? Math.round(essTotal  / grandTotal * 1000) / 10 : 0;
+  const nessPct = grandTotal > 0 ? Math.round(nessTotal / grandTotal * 1000) / 10 : 0;
+
+  // Chart.js 外圈：所有分類（非必須在前，必須在後）
+  const sortedItems = [...nessItems, ...essItems];
+  const outerColors = sortedItems.map((item) => {
+    if (essSet.has(item.name)) {
+      return ESS_COLORS[essItems.indexOf(item) % ESS_COLORS.length];
+    } else {
+      return NESS_COLORS[nessItems.indexOf(item) % NESS_COLORS.length];
+    }
+  });
+
+  // 取主題色
+  const cs = getComputedStyle(document.documentElement);
+  const tooltipBg  = cs.getPropertyValue('--bg2').trim() || '#1A2026';
+  const tooltipFg  = cs.getPropertyValue('--fg').trim()  || '#E8E9EC';
+  const borderCol  = cs.getPropertyValue('--bg').trim()  || '#0F1418';
+
+  // 建構 HTML
+  let h = `<div class="analysis-total-lbl">總消費金額（不含代墊）</div>`;
+  h += `<div class="analysis-total-val">${fmtMoney(grandTotal)}</div>`;
+  h += `<div class="ess-summary">
+    <div class="ess-card e">
+      <div class="ec-label">必須花費</div>
+      <div class="ec-val">${fmtMoney(essTotal)}</div>
+      <div class="ec-pct">${essPct}%</div>
+    </div>
+    <div class="ess-card n">
+      <div class="ec-label">非必須花費</div>
+      <div class="ec-val">${fmtMoney(nessTotal)}</div>
+      <div class="ec-pct">${nessPct}%</div>
+    </div>
   </div>`;
-  h += '</div>';
+  h += `<div style="max-width:260px;margin:0 auto 16px"><canvas id="pie-canvas"></canvas></div>`;
 
-  // 各分類詳細（依舊版邏輯：淨額<=0 的分類不顯示）
-  const catEntries = Object.entries(catTotals).filter(([cat,amt]) => amt > 0).sort((a,b) => b[1]-a[1]);
-  h += '<div class="chart-wrap">';
-  h += '<div class="chart-title">分類明細</div>';
-  h += '<table>';
-  h += '<tr><th>分類</th><th class="r">金額</th><th class="r">佔比</th></tr>';
-  catEntries.forEach(([cat, amt]) => {
-    const isEss = CATEGORIES.find(x => x.name === cat)?.essential;
-    h += `<tr>
-      <td>${escapeHtml(cat)} ${isEss?'<span style="color:var(--blue);font-size:10px">必須</span>':''}</td>
-      <td class="r">${fmtMoney(amt)}</td>
-      <td class="r dim">${pct(amt,grandTotal)}%</td>
+  if (essItems.length)  h += buildCatSection('必須花費明細',  'e', essItems,  essTotal,  grandTotal, ESS_COLORS);
+  if (nessItems.length) h += buildCatSection('非必須花費明細', 'n', nessItems, nessTotal, grandTotal, NESS_COLORS);
+
+  panel.innerHTML = h;
+
+  // 建立 Chart.js 雙層甜甜圈
+  setTimeout(() => {
+    const canvas = document.getElementById('pie-canvas');
+    if (!canvas) return;
+    if (pieChartInstance) { pieChartInstance.destroy(); pieChartInstance = null; }
+    pieChartInstance = new Chart(canvas.getContext('2d'), {
+      type: 'doughnut',
+      data: {
+        labels: sortedItems.map(x => x.name),
+        datasets: [
+          {
+            // 外圈：各分類
+            data: sortedItems.map(x => x.amount),
+            backgroundColor: outerColors,
+            borderWidth: 1.5,
+            borderColor: borderCol,
+          },
+          {
+            // 內圈：非必須 vs 必須（兩色）
+            data: [nessTotal, essTotal],
+            backgroundColor: ['#D85A30', '#534AB7'],
+            borderWidth: 3,
+            borderColor: borderCol,
+          }
+        ]
+      },
+      options: {
+        responsive: true,
+        cutout: '52%',
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: {
+              label(c) {
+                if (c.datasetIndex === 1) {
+                  const lbl = c.dataIndex === 0 ? '非必須花費' : '必須花費';
+                  const p = grandTotal > 0 ? Math.round(c.parsed / grandTotal * 1000) / 10 : 0;
+                  return `${lbl}: ${fmtMoney(c.parsed)} (${p}%)`;
+                }
+                const p = grandTotal > 0 ? Math.round(c.parsed / grandTotal * 1000) / 10 : 0;
+                return `${c.label}: ${fmtMoney(c.parsed)} (${p}%)`;
+              }
+            },
+            backgroundColor: tooltipBg,
+            titleColor: tooltipFg,
+            bodyColor: tooltipFg,
+            padding: 10,
+          }
+        }
+      }
+    });
+  }, 50);
+}
+
+// 建立分類表格區塊
+function buildCatSection(title, type, items, sectionTotal, grandTotal, colors) {
+  const totalPct = grandTotal > 0 ? Math.round(sectionTotal / grandTotal * 1000) / 10 : 0;
+
+  const rows = items.map((item, i) => {
+    const col = colors[i % colors.length];
+    const p = grandTotal > 0 ? Math.round(item.amount / grandTotal * 1000) / 10 : 0;
+    return `<tr>
+      <td><span class="cat-dot" style="background:${col}"></span>${escapeHtml(item.name)}</td>
+      <td class="r">${fmtMoney(item.amount)}</td>
+      <td class="r dim">${p}%</td>
+      <td style="width:56px"><div class="pct-bar-wrap"><div class="pct-bar" style="width:${Math.min(p*3,100)}%;background:${col}"></div></div></td>
     </tr>`;
-  });
-  h += `<tr><td class="bold">合計</td><td class="r bold">${fmtMoney(grandTotal)}</td><td></td></tr>`;
-  h += '</table>';
-  h += '<p class="dim" style="font-size:11px;margin-top:10px">※ 已排除「其他代墊」分類</p>';
-  h += '</div>';
+  }).join('');
 
-  document.getElementById('tab-content').innerHTML = h;
+  const subtotal = `<tr class="cat-subtotal">
+    <td>小計</td>
+    <td class="r">${fmtMoney(sectionTotal)}</td>
+    <td class="r">${totalPct}%</td>
+    <td></td>
+  </tr>`;
 
-  // 繪製圓餅圖
-  setTimeout(() => drawDonut('donut1', [
-    {label:'必須', value:mustTotal, color:'#5B9BD5'},
-    {label:'非必須', value:notMustTotal, color:'#FF9900'},
-  ]), 50);
+  return `<div class="cat-section">
+    <span class="cat-section-title ${type}">${title}</span>
+    <table class="cat-table">
+      <tr><th>分類</th><th class="r">金額</th><th class="r">佔比</th><th></th></tr>
+      ${rows}${subtotal}
+    </table>
+  </div>`;
 }
 
-function drawDonut(id, data) {
-  const c = document.getElementById(id);
-  if (!c) return;
-  const ctx = c.getContext('2d');
-  const W = c.width, H = c.height;
-  const cx = W/2, cy = H/2, r = 80, ir = 50;
-  const total = data.reduce((s,d) => s+d.value, 0);
-  if (total === 0) return;
-  ctx.clearRect(0,0,W,H);
-  let start = -Math.PI/2;
-  data.forEach(d => {
-    const slice = d.value/total * Math.PI * 2;
-    ctx.beginPath();
-    ctx.arc(cx, cy, r, start, start+slice);
-    ctx.arc(cx, cy, ir, start+slice, start, true);
-    ctx.closePath();
-    ctx.fillStyle = d.color;
-    ctx.fill();
-    start += slice;
-  });
-  // 中心文字（讀取 CSS 變數以適配主題）
-  const styles = getComputedStyle(document.documentElement);
-  const fgColor = styles.getPropertyValue('--fg').trim() || '#E8E9EC';
-  const fg2Color = styles.getPropertyValue('--fg2').trim() || '#A8AEB6';
-  ctx.fillStyle = fgColor;
-  ctx.font = 'bold 18px sans-serif';
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.fillText(fmtMoney(total), cx, cy-8);
-  ctx.font = '11px sans-serif';
-  ctx.fillStyle = fg2Color;
-  ctx.fillText('總計', cx, cy+12);
-}
-
-// ─── 歷史趨勢 ────────────────────────────────────────────────
+// ─── 歷史趨勢（Lazy 載入，以 TREND_CACHE 避免重複 fetch）──
 async function renderTrends() {
-  const wrap = document.getElementById('tab-content');
-  wrap.innerHTML = `<div style="text-align:center;padding:40px;color:var(--fg3)"><span class="loader"></span> 計算 6 個月歷史…</div>`;
-  // 取近 6 個月
+  const panel = document.getElementById('analysis-trend-panel');
+  if (!panel) return;
+
+  // 若已有快取，直接渲染不重新 fetch
+  if (TREND_CACHE) {
+    renderTrendContent(TREND_CACHE);
+    return;
+  }
+
+  // 初次載入
+  panel.innerHTML = `<div style="text-align:center;padding:40px;color:var(--fg3)"><span class="loader"></span> 計算 6 個月歷史…</div>`;
+
   const months = (window.AVAILABLE_MONTHS || []).slice(0, 6).reverse();
   const trends = [];
+  const essSet = new Set(CATEGORIES.filter(c => c.essential).map(c => c.name));
+
   for (const m of months) {
     try {
-      const r = await sheetGet(SHEET_ID, `${m}!A4:BL53`);
-      const rows = r.result.values || [];
-      let total = 0, must = 0, notMust = 0;
-      BANKS_CARDS.forEach(b => {
-        const cIdx = colToIdx(b.col);
+      const r = await retryWithAuth(() => gapi.client.sheets.spreadsheets.get({
+        spreadsheetId: SHEET_ID,
+        ranges: [`${m}!A4:BL53`],
+        fields: 'sheets.data.rowData.values(effectiveValue)',
+      }));
+      const rowDataArr = r.result.sheets?.[0]?.data?.[0]?.rowData || [];
+      let total = 0, ess = 0, non = 0;
+
+      BANKS_CARDS.forEach(card => {
+        const aIdx = colToIdx(card.col) + 1;
+        const ccIdx = colToIdx(card.col) + 3;
         for (let i = 0; i < 50; i++) {
-          const rr = rows[i] || [];
-          const amt = parseAmount(rr[cIdx+1]);
-          const cat = rr[cIdx+3];
-          if (amt == null) continue;
+          const cells = rowDataArr[i]?.values || [];
+          const n = cells[aIdx]?.effectiveValue?.numberValue;
+          if (n == null || n === 0) continue;
+          const cat = cells[ccIdx]?.effectiveValue?.stringValue || '';
           if (cat === '其他代墊') continue;
-          total += amt;
-          const c = CATEGORIES.find(x => x.name === cat);
-          if (c?.essential) must += amt;
-          else notMust += amt;
+          total += n;
+          if (essSet.has(cat)) ess += n; else non += n;
         }
       });
-      trends.push({month: m, total, must, notMust});
+      trends.push({month: m, total, ess, non});
     } catch (e) {
-      trends.push({month: m, total: 0, must: 0, notMust: 0});
+      trends.push({month: m, total: 0, ess: 0, non: 0});
     }
   }
-  let h = '<div class="chart-wrap">';
-  h += '<div class="chart-title">過去 6 個月消費走勢</div>';
-  h += '<canvas id="trend-chart" width="320" height="180" style="width:100%;max-width:100%"></canvas>';
-  h += `<div class="legend" style="margin-top:10px">
-    <div class="legend-item"><span class="legend-dot" style="background:#E57373"></span>總計</div>
-    <div class="legend-item"><span class="legend-dot" style="background:#5B9BD5"></span>必須</div>
-    <div class="legend-item"><span class="legend-dot" style="background:#FF9900"></span>非必須</div>
-  </div>`;
-  h += '</div>';
 
-  h += '<div class="chart-wrap"><div class="chart-title">月份明細</div><table>';
-  h += '<tr><th>月份</th><th class="r">總計</th><th class="r">必須</th><th class="r">非必須</th></tr>';
+  TREND_CACHE = trends;
+  renderTrendContent(trends);
+}
+
+function renderTrendContent(trends) {
+  const panel = document.getElementById('analysis-trend-panel');
+  if (!panel) return;
+
+  const cs = getComputedStyle(document.documentElement);
+  const tooltipBg = cs.getPropertyValue('--bg2').trim();
+  const tooltipFg = cs.getPropertyValue('--fg').trim();
+  const gridColor = cs.getPropertyValue('--bg3').trim();
+  const tickColor = cs.getPropertyValue('--fg3').trim();
+
+  let h = `<div class="trend-legend">
+    <div class="tl-item"><div class="tl-dot" style="background:#534AB7"></div>消費總計</div>
+    <div class="tl-item"><div class="tl-dot" style="background:#1D9E75"></div>必須花費</div>
+    <div class="tl-item"><div class="tl-dot" style="background:#D85A30"></div>非必須花費</div>
+  </div>`;
+  h += `<div style="margin-bottom:14px"><canvas id="trend-canvas"></canvas></div>`;
+  h += `<table class="cat-table">
+    <tr><th>月份</th><th class="r">消費總計</th><th class="r" style="color:#1D9E75">必須</th><th class="r" style="color:#D85A30">非必須</th></tr>`;
   trends.slice().reverse().forEach(t => {
     const [yy, mm] = t.month.split('_');
     h += `<tr>
       <td>20${yy}/${mm}</td>
       <td class="r">${fmtMoney(t.total)}</td>
-      <td class="r blue">${fmtMoney(t.must)}</td>
-      <td class="r orange">${fmtMoney(t.notMust)}</td>
+      <td class="r" style="color:#1D9E75">${fmtMoney(t.ess)}</td>
+      <td class="r" style="color:#D85A30">${fmtMoney(t.non)}</td>
     </tr>`;
   });
-  h += '</table></div>';
-  wrap.innerHTML = h;
-  setTimeout(() => drawTrendLine(trends), 50);
-}
+  h += '</table>';
+  panel.innerHTML = h;
 
-function drawTrendLine(trends) {
-  const c = document.getElementById('trend-chart');
-  if (!c) return;
-  const ctx = c.getContext('2d');
-  const W = c.width, H = c.height;
-  const padL=40, padR=10, padT=20, padB=30;
-  const w = W - padL - padR, h = H - padT - padB;
-  ctx.clearRect(0,0,W,H);
-  if (!trends.length) return;
-  const maxV = Math.max(...trends.map(t => t.total), 1);
-  const series = [
-    {key:'total', color:'#E57373'},
-    {key:'must', color:'#5B9BD5'},
-    {key:'notMust', color:'#FF9900'},
-  ];
-  // 主題色
-  const styles = getComputedStyle(document.documentElement);
-  const fg2Color = styles.getPropertyValue('--fg2').trim() || '#A8AEB6';
-  const fg3Color = styles.getPropertyValue('--fg3').trim() || '#6B7480';
-  const bg3Color = styles.getPropertyValue('--bg3').trim() || '#262E36';
+  setTimeout(() => {
+    const canvas = document.getElementById('trend-canvas');
+    if (!canvas) return;
+    if (trendChartInstance) { trendChartInstance.destroy(); trendChartInstance = null; }
 
-  // X axis labels
-  ctx.fillStyle = fg2Color;
-  ctx.font = '10px sans-serif';
-  ctx.textAlign = 'center';
-  trends.forEach((t, i) => {
-    const x = padL + (i / Math.max(trends.length-1,1)) * w;
-    const [yy, mm] = t.month.split('_');
-    ctx.fillText(`${yy}/${mm}`, x, H - padB + 14);
-  });
-  // Grid lines
-  ctx.strokeStyle = bg3Color;
-  ctx.lineWidth = 1;
-  for (let i = 0; i <= 4; i++) {
-    const y = padT + (i/4) * h;
-    ctx.beginPath();
-    ctx.moveTo(padL, y);
-    ctx.lineTo(W-padR, y);
-    ctx.stroke();
-    ctx.fillStyle = fg3Color;
-    ctx.textAlign = 'right';
-    ctx.fillText(fmtMoneyShort(maxV * (1 - i/4)), padL-4, y+3);
-  }
-  // Lines
-  series.forEach(s => {
-    ctx.strokeStyle = s.color;
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    trends.forEach((t, i) => {
-      const x = padL + (i / Math.max(trends.length-1,1)) * w;
-      const y = padT + h - (t[s.key] / maxV) * h;
-      if (i === 0) ctx.moveTo(x, y);
-      else ctx.lineTo(x, y);
+    trendChartInstance = new Chart(canvas.getContext('2d'), {
+      type: 'line',
+      data: {
+        labels: trends.map(t => { const [yy,mm] = t.month.split('_'); return `${yy}/${mm}`; }),
+        datasets: [
+          {
+            label: '消費總計',
+            data: trends.map(t => t.total),
+            borderColor: '#534AB7',
+            backgroundColor: 'rgba(83,74,183,.12)',
+            tension: 0.3,
+            fill: true,
+            pointBackgroundColor: '#534AB7',
+            pointRadius: 4,
+          },
+          {
+            label: '必須花費',
+            data: trends.map(t => t.ess),
+            borderColor: '#1D9E75',
+            backgroundColor: 'transparent',
+            tension: 0.3,
+            fill: false,
+            pointBackgroundColor: '#1D9E75',
+            pointRadius: 4,
+          },
+          {
+            label: '非必須花費',
+            data: trends.map(t => t.non),
+            borderColor: '#D85A30',
+            backgroundColor: 'transparent',
+            tension: 0.3,
+            fill: false,
+            pointBackgroundColor: '#D85A30',
+            pointRadius: 4,
+          }
+        ]
+      },
+      options: {
+        responsive: true,
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: {
+              label: c => `${c.dataset.label}: ${fmtMoney(c.parsed.y)}`
+            },
+            backgroundColor: tooltipBg,
+            titleColor: tooltipFg,
+            bodyColor: tooltipFg,
+            padding: 10,
+          }
+        },
+        scales: {
+          y: {
+            ticks: {
+              callback: v => Math.abs(v) >= 10000 ? '$' + Math.round(v/1000) + 'k' : '$' + Math.round(v).toLocaleString(),
+              color: tickColor,
+            },
+            grid: { color: gridColor }
+          },
+          x: {
+            ticks: { color: tickColor },
+            grid: { display: false }
+          }
+        }
+      }
     });
-    ctx.stroke();
-    // Dots
-    trends.forEach((t, i) => {
-      const x = padL + (i / Math.max(trends.length-1,1)) * w;
-      const y = padT + h - (t[s.key] / maxV) * h;
-      ctx.fillStyle = s.color;
-      ctx.beginPath();
-      ctx.arc(x, y, 3, 0, Math.PI*2);
-      ctx.fill();
-    });
-  });
-}
-
-function fmtMoneyShort(v) {
-  if (Math.abs(v) >= 10000) return Math.round(v/1000) + 'k';
-  return Math.round(v).toString();
+  }, 50);
 }
 
 // ─── 工具函式 ────────────────────────────────────────────────
@@ -1385,19 +1520,23 @@ function closeMenu() { document.getElementById('menu-modal').classList.add('hidd
 function toggleTheme() {
   const isLight = document.documentElement.classList.toggle('light');
   localStorage.setItem('theme', isLight ? 'light' : 'dark');
-  // 更新 status bar 主題色
   const meta = document.querySelector('meta[name="theme-color"]');
   if (meta) meta.setAttribute('content', isLight ? '#FFFFFF' : '#534AB7');
-  // 更新選單按鈕標籤
   const themeBtn = document.getElementById('menu-theme-btn');
   if (themeBtn) themeBtn.innerHTML = isLight ? '🌙 切換為深色模式' : '☀ 切換為淺色模式';
-  // 重新繪圖表（圖表用 canvas，需重畫才會吃到新色）
-  if (CURRENT_TAB === 'analysis' || CURRENT_TAB === 'trends') {
-    setTimeout(() => renderTab(), 100);
+  // 圖表需要重建才能吃到新的配色
+  if (pieChartInstance) { pieChartInstance.destroy(); pieChartInstance = null; }
+  if (trendChartInstance) { trendChartInstance.destroy(); trendChartInstance = null; }
+  if (CURRENT_TAB === 'analysis') {
+    setTimeout(() => renderAnalysis(), 50);
   }
 }
 
 async function reloadAll() {
+  // 清除圖表快取與實例
+  TREND_CACHE = null;
+  if (pieChartInstance) { pieChartInstance.destroy(); pieChartInstance = null; }
+  if (trendChartInstance) { trendChartInstance.destroy(); trendChartInstance = null; }
   await loadCategories();
   await detectAvailableMonths();
   populateMonthSelector();

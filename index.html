@@ -208,6 +208,44 @@ td.r,th.r{text-align:right}
 .dim{color:var(--fg3)}
 .bold{font-weight:700}
 
+/* ─── 消費分析重構 ─── */
+.sub-tab-bar{display:flex;margin-bottom:14px;border-radius:8px;overflow:hidden;border:1px solid var(--bg3)}
+.sub-tab-btn{flex:1;padding:9px 8px;font-size:13px;font-weight:500;color:var(--fg2);background:var(--bg3);border:none;cursor:pointer;transition:background .15s,color .15s}
+.sub-tab-btn.active{background:var(--primary);color:#fff}
+
+.analysis-total-val{font-size:24px;font-weight:700;color:var(--primary2);text-align:center;margin-bottom:2px}
+.analysis-total-lbl{font-size:12px;color:var(--fg3);text-align:center;margin-bottom:12px}
+
+.ess-summary{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px}
+.ess-card{border-radius:10px;padding:10px 12px;text-align:center}
+.ess-card.e{background:rgba(83,74,183,.18)}.ess-card.n{background:rgba(216,90,48,.12)}
+.ec-label{font-size:10px;margin-bottom:3px;font-weight:500}
+.ec-val{font-size:16px;font-weight:700}
+.ec-pct{font-size:11px;margin-top:2px;opacity:.8}
+.ess-card.e .ec-label,.ess-card.e .ec-val,.ess-card.e .ec-pct{color:#AFA9EC}
+.ess-card.n .ec-label,.ess-card.n .ec-val,.ess-card.n .ec-pct{color:#FAC775}
+:root.light .ess-card.e{background:#EEEDFE}
+:root.light .ess-card.n{background:#FAECE7}
+:root.light .ess-card.e .ec-label,:root.light .ess-card.e .ec-val,:root.light .ess-card.e .ec-pct{color:#534AB7}
+:root.light .ess-card.n .ec-label,:root.light .ess-card.n .ec-val,:root.light .ess-card.n .ec-pct{color:#D85A30}
+
+.cat-section{margin-bottom:14px}
+.cat-section-title{font-size:11px;font-weight:700;padding:4px 10px;border-radius:6px;margin-bottom:8px;display:inline-block;letter-spacing:.03em}
+.cat-section-title.e{background:rgba(83,74,183,.2);color:#AFA9EC}
+.cat-section-title.n{background:rgba(216,90,48,.15);color:#FAC775}
+:root.light .cat-section-title.e{background:#EEEDFE;color:#3C3489}
+:root.light .cat-section-title.n{background:#FAECE7;color:#993C1D}
+
+.cat-dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:5px;vertical-align:middle;flex-shrink:0}
+.pct-bar-wrap{background:var(--bg3);border-radius:3px;height:4px;min-width:40px}
+.pct-bar{height:4px;border-radius:3px}
+.cat-subtotal td{background:var(--bg3)!important;font-weight:600}
+.cat-table th{text-transform:none}
+
+.trend-legend{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:10px}
+.tl-item{display:flex;align-items:center;gap:5px;font-size:12px;color:var(--fg2)}
+.tl-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
+
 /* PWA Install Banner */
 .pwa-banner{position:fixed;bottom:0;left:0;right:0;background:var(--primary);color:#fff;padding:12px 16px;display:flex;align-items:center;gap:12px;z-index:300;box-shadow:0 -4px 20px rgba(83,74,183,.5);animation:slideUp .3s ease}
 @keyframes slideUp{from{transform:translateY(100%)}to{transform:translateY(0)}}
@@ -302,7 +340,6 @@ td.r,th.r{text-align:right}
     <div class="tabs">
       <button class="tab-btn active" data-tab="dashboard" onclick="switchTab('dashboard')">儀表板</button>
       <button class="tab-btn" data-tab="analysis" onclick="switchTab('analysis')">消費分析</button>
-      <button class="tab-btn" data-tab="trends" onclick="switchTab('trends')">歷史趨勢</button>
     </div>
 
     <div class="content" id="tab-content">
@@ -426,9 +463,11 @@ td.r,th.r{text-align:right}
   </div>
 </div>
 
+<!-- Chart.js -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
 <!-- Google APIs -->
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 <script src="https://apis.google.com/js/api.js" async defer></script>
-<script src="app.js?v=1.6"></script>
+<script src="app.js?v=1.7"></script>
 </body>
 </html>
