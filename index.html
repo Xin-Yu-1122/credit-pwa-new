@@ -9,6 +9,25 @@
 <meta name="apple-mobile-web-app-title" content="信用卡記帳">
 <meta name="theme-color" content="#534AB7">
 <title>信用卡記帳</title>
+<!-- ⚠️ 必須在所有其他 script 之前捕捉 beforeinstallprompt，否則手機版會錯過事件 -->
+<script>
+  window._pwaPrompt = null;
+  window.addEventListener('beforeinstallprompt', function(e) {
+    e.preventDefault();
+    window._pwaPrompt = e;
+    console.log('[PWA] beforeinstallprompt captured ✓');
+    // 如果 app 已載入就直接顯示 banner，否則等 app 準備好
+    if (window._pwaReady) {
+      window._showPwaBanner();
+    }
+  });
+  window.addEventListener('appinstalled', function() {
+    console.log('[PWA] App installed ✓');
+    window._pwaPrompt = null;
+    var b = document.getElementById('pwa-banner');
+    if (b) b.classList.add('hidden');
+  });
+</script>
 <link rel="manifest" href="manifest.json">
 <link rel="apple-touch-icon" href="icon-192.png">
 <link rel="icon" type="image/png" sizes="192x192" href="icon-192.png">
@@ -331,6 +350,7 @@ td.r,th.r{text-align:right}
     <div class="modal-handle"></div>
     <h2>選單</h2>
     <div style="display:flex;flex-direction:column;gap:8px">
+      <button class="btn btn-primary btn-full" id="menu-install-btn" onclick="closeMenu();triggerInstall()" style="display:none">📲 安裝為 App</button>
       <button class="btn btn-ghost btn-full" onclick="closeMenu();openSheet()">📊 開啟 Google 試算表</button>
       <button class="btn btn-ghost btn-full" onclick="closeMenu();reloadAll()">🔄 重新載入資料</button>
       <button class="btn btn-ghost btn-full" onclick="closeMenu();openSetupAgain()">⚙ 變更試算表</button>

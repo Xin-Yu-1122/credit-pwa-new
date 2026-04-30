@@ -1113,7 +1113,15 @@ function notify(msg, type='') {
 }
 
 // 選單
-function openMenu() { document.getElementById('menu-modal').classList.remove('hidden'); }
+function openMenu() {
+  // 若有安裝 prompt 可用，在選單顯示安裝按鈕
+  const installBtn = document.getElementById('menu-install-btn');
+  if (installBtn) {
+    const isStandalone = window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone;
+    installBtn.style.display = (window._pwaPrompt && !isStandalone) ? '' : 'none';
+  }
+  document.getElementById('menu-modal').classList.remove('hidden');
+}
 function closeMenu() { document.getElementById('menu-modal').classList.add('hidden'); }
 
 async function reloadAll() {
@@ -1126,31 +1134,32 @@ async function reloadAll() {
 }
 
 // ─── PWA 安裝提示 ────────────────────────────────────────────
-let _deferredPrompt = null;
+// beforeinstallprompt 已在 index.html <head> 最早捕捉，存在 window._pwaPrompt
 
-window.addEventListener('beforeinstallprompt', e => {
-  e.preventDefault();
-  _deferredPrompt = e;
-  // 若使用者沒關閉過，顯示安裝 banner
-  if (!localStorage.getItem('pwa-banner-dismissed')) {
-    setTimeout(() => {
-      document.getElementById('pwa-banner')?.classList.remove('hidden');
-    }, 2000);
-  }
-});
+// App 載入完成後，定義 _showPwaBanner 並觸發（如果事件已捕捉到）
+window._showPwaBanner = function() {
+  if (localStorage.getItem('pwa-banner-dismissed')) return;
+  if (window.matchMedia('(display-mode: standalone)').matches) return;
+  setTimeout(() => {
+    const banner = document.getElementById('pwa-banner');
+    if (banner) banner.classList.remove('hidden');
+  }, 1500);
+};
 
-window.addEventListener('appinstalled', () => {
-  _deferredPrompt = null;
-  document.getElementById('pwa-banner')?.classList.add('hidden');
-  notify('✓ App 已安裝！', 'ok');
-});
+// 標記 app 已就緒，若事件已提前捕捉就立刻顯示
+window._pwaReady = true;
+if (window._pwaPrompt) {
+  window._showPwaBanner();
+}
 
 function triggerInstall() {
-  if (!_deferredPrompt) return;
-  _deferredPrompt.prompt();
-  _deferredPrompt.userChoice.then(r => {
-    _deferredPrompt = null;
+  const prompt = window._pwaPrompt;
+  if (!prompt) return;
+  prompt.prompt();
+  prompt.userChoice.then(r => {
+    window._pwaPrompt = null;
     document.getElementById('pwa-banner')?.classList.add('hidden');
+    if (r.outcome === 'accepted') notify('✓ App 已安裝！', 'ok');
   });
 }
 
@@ -1168,8 +1177,9 @@ function dismissIosGuide() {
 (function checkIOSInstall() {
   const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
   const isStandalone = window.navigator.standalone === true;
+  const isStandaloneMQ = window.matchMedia('(display-mode: standalone)').matches;
   const dismissed = localStorage.getItem('ios-guide-dismissed');
-  if (isIOS && !isStandalone && !dismissed) {
+  if (isIOS && !isStandalone && !isStandaloneMQ && !dismissed) {
     setTimeout(() => {
       document.getElementById('ios-guide')?.classList.remove('hidden');
     }, 3000);
