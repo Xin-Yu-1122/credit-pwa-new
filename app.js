@@ -4,7 +4,7 @@
 
 const CLIENT_ID = '144262693536-poq7p69eo0aqr3r0onjafrd2f1rfrmg3.apps.googleusercontent.com';
 const SCOPES = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file';
-const APP_VERSION = 'v1.0';
+const APP_VERSION = 'v1.2';
 
 // 銀行/卡片定義（依試算表欄位順序）
 const BANKS_CARDS = [
