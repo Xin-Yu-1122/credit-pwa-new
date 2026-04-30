@@ -4,7 +4,7 @@
 
 const CLIENT_ID = '144262693536-poq7p69eo0aqr3r0onjafrd2f1rfrmg3.apps.googleusercontent.com';
 const SCOPES = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file';
-const APP_VERSION = 'v1.7';
+const APP_VERSION = 'v1.8';
 
 // 9 個銀行（用於儀表板顯示與計算）
 // totalCol = 該銀行總計欄(row 56)；paidCol/accBalCol = 在 row 57 該銀行的「已匯入」「帳戶餘額」位置
@@ -40,6 +40,19 @@ const BANKS_CARDS = [
   {key:'cb_2108', col:'BE', bankKey:'cb',   bank:'彰銀', name:'My 購',        tag:'2108'},
   {key:'cc_3568', col:'BI', bankKey:'cc',   bank:'中信', name:'英雄聯盟',     tag:'3568'},
 ];
+
+// 銀行群組設定：bankKey → 預設卡 cardKey（給記帳表單用）
+const BANK_DEFAULT_CARD = {
+  cash: 'cash',
+  fb:   'fb_5389',  // 預設好市多
+  es:   'es_2649',  // 預設 Unicard
+  ub:   'ub_9207',  // 預設 Line Bank
+  cu:   'cu_3568',
+  tx:   'tx_0106',
+  sf:   'sf_2207',
+  cb:   'cb_2108',
+  cc:   'cc_3568',
+};
 
 // 9 種底色（位置 0=無 1-8=色）
 const COLORS = [
@@ -172,6 +185,7 @@ function boot() {
   const tokenExpiry = parseInt(localStorage.getItem('credit-token-expiry') || '0');
 
   if (savedToken && Date.now() < tokenExpiry) {
+    // Token 還沒過期，直接使用
     TOKEN = savedToken;
     gapi.client.setToken({access_token: TOKEN});
     if (SHEET_ID) {
@@ -180,9 +194,48 @@ function boot() {
     } else {
       showSetup();
     }
+  } else if (savedToken) {
+    // Token 過期但有舊紀錄 → 嘗試靜默刷新（不彈窗）
+    silentRefresh().then(() => {
+      if (SHEET_ID) {
+        showApp();
+        initApp();
+      } else {
+        showSetup();
+      }
+    }).catch(() => {
+      // 靜默失敗才顯示登入
+      showLogin();
+    });
   } else {
     showLogin();
   }
+}
+
+// 靜默刷新 token（不彈出 OAuth 視窗）
+function silentRefresh() {
+  return new Promise((resolve, reject) => {
+    if (!TOKEN_CLIENT) return reject('No token client');
+    const timeout = setTimeout(() => reject('timeout'), 8000);
+    TOKEN_CLIENT.callback = (resp) => {
+      clearTimeout(timeout);
+      if (resp.error) return reject(resp.error);
+      TOKEN = resp.access_token;
+      // 提前 5 分鐘失效（給網路慢的情況留 buffer）
+      const expiry = Date.now() + (resp.expires_in || 3600) * 1000 - 300000;
+      localStorage.setItem('credit-token', TOKEN);
+      localStorage.setItem('credit-token-expiry', expiry.toString());
+      gapi.client.setToken({access_token: TOKEN});
+      resolve();
+    };
+    // prompt='' = 不彈窗（如果使用者已授權過會直接成功）
+    try {
+      TOKEN_CLIENT.requestAccessToken({prompt: ''});
+    } catch (e) {
+      clearTimeout(timeout);
+      reject(e);
+    }
+  });
 }
 
 // ─── OAuth ──────────────────────────────────────────────────
@@ -201,8 +254,8 @@ function tokenCallback(resp) {
     return;
   }
   TOKEN = resp.access_token;
-  // Token 通常 1 小時，存起來
-  const expiry = Date.now() + (resp.expires_in || 3600) * 1000 - 60000; // 提前 1 分鐘失效
+  // Token 通常 1 小時，提前 5 分鐘失效
+  const expiry = Date.now() + (resp.expires_in || 3600) * 1000 - 300000;
   localStorage.setItem('credit-token', TOKEN);
   localStorage.setItem('credit-token-expiry', expiry.toString());
   gapi.client.setToken({access_token: TOKEN});
@@ -231,7 +284,7 @@ function refreshToken() {
     TOKEN_CLIENT.callback = (resp) => {
       if (resp.error) return reject(resp.error);
       TOKEN = resp.access_token;
-      const expiry = Date.now() + (resp.expires_in || 3600) * 1000 - 60000;
+      const expiry = Date.now() + (resp.expires_in || 3600) * 1000 - 300000;
       localStorage.setItem('credit-token', TOKEN);
       localStorage.setItem('credit-token-expiry', expiry.toString());
       gapi.client.setToken({access_token: TOKEN});
@@ -517,18 +570,102 @@ async function detectAvailableMonths() {
 }
 
 function populateMonthSelector() {
-  const sel = document.getElementById('month-sel');
-  sel.innerHTML = (window.AVAILABLE_MONTHS || []).map(m => {
+  const months = window.AVAILABLE_MONTHS || [];
+  const items = months.map(m => {
     const [yy, mm] = m.split('_');
-    return `<option value="${m}">20${yy}/${mm}</option>`;
-  }).join('');
-  sel.value = CURRENT_MONTH;
+    return {value: m, label: `20${yy}/${mm}`};
+  });
+  csInit('cs-month-wrap', items, CURRENT_MONTH, async (newVal) => {
+    CURRENT_MONTH = newVal;
+    await loadCurrentMonth();
+  });
 }
 
+// ─── Custom Select 工具 ──────────────────────────────────────
+function csInit(wrapId, items, currentValue, onChange) {
+  const wrap = document.getElementById(wrapId);
+  if (!wrap) return;
+  wrap._items = items;
+  wrap._onChange = onChange;
+  csSetValue(wrapId, currentValue);
+  // 渲染選項列表
+  const panel = wrap.querySelector('.cs-panel');
+  panel.innerHTML = items.map(it =>
+    `<div class="cs-opt ${it.value===currentValue?'selected':''}" data-value="${escapeHtml(it.value)}">${escapeHtml(it.label)}</div>`
+  ).join('');
+  panel.querySelectorAll('.cs-opt').forEach(opt => {
+    opt.onclick = () => {
+      const v = opt.dataset.value;
+      csSetValue(wrapId, v);
+      panel.querySelectorAll('.cs-opt').forEach(o => o.classList.toggle('selected', o.dataset.value === v));
+      wrap.classList.remove('open');
+      if (wrap._onChange) wrap._onChange(v);
+    };
+  });
+}
+
+function csSetValue(wrapId, value) {
+  const wrap = document.getElementById(wrapId);
+  if (!wrap) return;
+  wrap._value = value;
+  const items = wrap._items || [];
+  const found = items.find(i => i.value === value);
+  // 找到對應的 label 元素
+  const labelEl = wrap.querySelector('.cs-trigger span') || wrap.querySelector('.cs-trigger');
+  if (labelEl && found) labelEl.textContent = found.label;
+}
+
+function csGetValue(wrapId) {
+  return document.getElementById(wrapId)?._value;
+}
+
+function csToggle(wrapId) {
+  // 先關掉所有其他下拉
+  document.querySelectorAll('.cs-wrap.open').forEach(w => {
+    if (w.id !== wrapId) w.classList.remove('open');
+  });
+  document.getElementById(wrapId)?.classList.toggle('open');
+}
+
+// 點擊外部關閉所有 cs-wrap
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('.cs-wrap')) {
+    document.querySelectorAll('.cs-wrap.open').forEach(w => w.classList.remove('open'));
+  }
+});
+
 function populateBankSelector() {
-  const sel = document.getElementById('f-bank');
+  // 銀行群組（9 個）
+  const sel = document.getElementById('f-bankgroup');
   sel.innerHTML = '<option value="">— 請選擇 —</option>' +
-    BANKS_CARDS.map(b => `<option value="${b.key}">${b.bank}：${b.name}${b.tag?` (${b.tag})`:''}</option>`).join('');
+    BANKS.map(b => `<option value="${b.key}">${b.name}</option>`).join('');
+}
+
+// 切換銀行 → 自動帶卡別下拉（單卡銀行直接隱藏）
+function onBankGroupChange() {
+  const bankKey = document.getElementById('f-bankgroup').value;
+  const cardField = document.getElementById('f-card-field');
+  const cardSel = document.getElementById('f-card');
+  if (!bankKey) {
+    cardField.classList.add('hidden');
+    cardSel.innerHTML = '';
+    return;
+  }
+  const cards = BANKS_CARDS.filter(c => c.bankKey === bankKey);
+  if (cards.length <= 1) {
+    // 單卡銀行：隱藏卡別下拉，內部維持唯一一張
+    cardField.classList.add('hidden');
+    cardSel.innerHTML = `<option value="${cards[0]?.key || ''}">${cards[0]?.name || ''}</option>`;
+    cardSel.value = cards[0]?.key || '';
+  } else {
+    // 多卡銀行：顯示卡別下拉，套用預設
+    cardField.classList.remove('hidden');
+    cardSel.innerHTML = cards.map(c =>
+      `<option value="${c.key}">${c.name}${c.tag?` (${c.tag})`:''}</option>`
+    ).join('');
+    const def = BANK_DEFAULT_CARD[bankKey] || cards[0]?.key;
+    cardSel.value = def;
+  }
 }
 
 function populateCategorySelector() {
@@ -558,11 +695,6 @@ function selectColor(id) {
 function onInstallmentChange() {
   const checked = document.getElementById('f-installment').checked;
   if (checked) selectColor(2); // 自動套橘色
-}
-
-async function onMonthChange() {
-  CURRENT_MONTH = document.getElementById('month-sel').value;
-  await loadCurrentMonth();
 }
 
 async function loadCurrentMonth() {
@@ -790,7 +922,7 @@ function getCardTotal(cardKey) {
 
 // ─── 儀表板 ──────────────────────────────────────────────────
 function renderDashboard() {
-  // 全域加總（嚴格對應舊版 GAS 邏輯）
+  // 全域加總
   let gTotal = 0, gRebate = 0, gPaid = 0, gPending = 0, gInstall = 0, gAccBalAccum = 0;
 
   BANKS.forEach(b => {
@@ -800,16 +932,14 @@ function renderDashboard() {
     gRebate += bd.rebate;
     gInstall += bd.install;
     if (b.isCash) {
-      // 現金的 paid (D57) 是現金餘額本身
       gAccBalAccum += bd.paid;
     } else {
       gPaid += bd.paid;
       gPending += bd.pending;
-      gAccBalAccum += bd.accBal; // 各卡的「透支金額」(rawAcc<0 時的絕對值)
+      gAccBalAccum += bd.accBal;
     }
   });
   const gNet = gTotal - gRebate;
-  // 最終：(現金 + 各卡透支) - 待匯入繳款
   const gAccBalTotal = gAccBalAccum - gPending;
 
   // KPI
@@ -821,51 +951,61 @@ function renderDashboard() {
   h += `<div class="kpi-card"><div class="kpi-label">待匯入繳款</div><div class="kpi-value red">${fmtMoney(gPending)}</div></div>`;
   h += `<div class="kpi-card"><div class="kpi-label">本月分期</div><div class="kpi-value orange">${fmtMoney(gInstall)}</div></div>`;
   h += `</div>`;
-  h += `<div class="card"><div class="card-title">現金及帳戶餘額</div><div class="card-value ${gAccBalTotal < 0 ? 'red' : ''}">${fmtMoney(gAccBalTotal)}</div><div class="card-sub">${gAccBalTotal < 0 ? '⚠ 透支' : '可用餘額'}</div></div>`;
+  h += `<div class="card"><div class="card-title">預計餘額</div><div class="card-value ${gAccBalTotal < 0 ? 'red' : ''}">${fmtMoney(gAccBalTotal)}</div><div class="card-sub">${gAccBalTotal < 0 ? '⚠ 透支' : '可用餘額'}</div></div>`;
 
-  // 各銀行摘要
-  h += `<div style="margin-top:14px;font-size:13px;font-weight:600;color:var(--fg2);margin-bottom:8px">各銀行摘要</div>`;
+  // 各銀行摘要 - 標題列 + 重新整理按鈕
+  h += `<div class="section-head">
+    <div class="section-head-title">各銀行摘要</div>
+    <button class="refresh-mini" id="dashRefreshBtn" onclick="refreshDashboard()"><span class="ricon">⟳</span> 重新整理</button>
+  </div>`;
+  h += `<div class="bank-grid">`;
 
   BANKS.forEach(b => {
     const bd = BANK_DATA[b.key];
     if (!bd) return;
-    if (bd.total === 0 && bd.paid === 0 && bd.install === 0) return;
+    if (bd.total === 0 && bd.paid === 0 && bd.install === 0 && bd.rebate === 0) return;
 
     if (b.isCash) {
       h += `<div class="card-row">
-        <div class="card-row-head">
-          <div class="card-row-name"><span>${b.name}</span></div>
-          <div class="card-row-amt">${fmtMoney(bd.total)}</div>
+        <div class="bank-head">
+          <div class="bank-name">${b.name}</div>
         </div>
-        <div class="card-row-meta">
-          <span>消費總計 <b>${fmtMoney(bd.total)}</b></span>
-          <span>目前現金 <b class="green">${fmtMoney(bd.paid)}</b></span>
-        </div>
+        <div class="bank-line"><span>消費總計</span><span class="v">${fmtMoney(bd.total)}</span></div>
+        <div class="bank-line divider"></div>
+        <div class="bank-line"><span>目前現金</span><span class="v green">${fmtMoney(bd.paid)}</span></div>
       </div>`;
     } else {
-      h += `<div class="card-row ${bd.isPaidCheck?'paid':''}">
-        <div class="card-row-head">
-          <div class="card-row-name">
-            <span>${b.name}</span>
-            ${b.dateInfo?`<span class="card-row-tag">${b.dateInfo}</span>`:''}
-          </div>
-          <div class="card-row-amt">${fmtMoney(bd.total)}</div>
+      const isPaid = bd.isPaidCheck;
+      h += `<div class="card-row ${isPaid?'paid':''}">
+        <div class="paid-badge">✓ 已繳</div>
+        <div class="bank-head">
+          <div class="bank-name">${b.name}</div>
+          ${b.dateInfo?`<div class="bank-info">${b.dateInfo}</div>`:''}
         </div>
-        <div class="card-row-meta">
-          ${bd.install ? `<span>分期 <b class="orange">${fmtMoney(bd.install)}</b></span>` : ''}
-          ${bd.rebate ? `<span>折抵 <b class="green">-${fmtMoney(bd.rebate)}</b></span>` : ''}
-          ${bd.rebate ? `<span>繳款 <b>${fmtMoney(bd.net)}</b></span>` : ''}
-          <span>已匯 <b class="blue">${fmtMoney(bd.paid)}</b></span>
-          <span>待繳 <b class="${bd.pending>0?'red':'green'}">${fmtMoney(bd.pending)}</b></span>
-          <span>餘額 <b>${fmtMoney(bd.accBal)}</b></span>
-        </div>
-        <div class="card-row-actions">
-          <label class="chk-paid"><input type="checkbox" ${bd.isPaidCheck?'checked':''} onchange="togglePaid('${b.key}',this.checked)"/> 已繳費</label>
-        </div>
+        <div class="bank-line"><span>分期</span><span class="v ${bd.install?'orange':''}">${fmtMoney(bd.install)}</span></div>
+        <div class="bank-line"><span>消費總計</span><span class="v">${fmtMoney(bd.total)}</span></div>
+        <div class="bank-line"><span>折抵</span><span class="v ${bd.rebate?'teal':''}">${bd.rebate?'-'+fmtMoney(bd.rebate):fmtMoney(0)}</span></div>
+        <div class="bank-line"><span>繳費金額</span><span class="v">${fmtMoney(bd.net)}</span></div>
+        <div class="bank-line"><span>已匯入</span><span class="v blue">${fmtMoney(bd.paid)}</span></div>
+        <div class="bank-line highlight"><span>待繳</span><span class="v ${bd.pending>0?'red':'green'}">${fmtMoney(bd.pending)}</span></div>
+        <div class="bank-line sub"><span>帳戶餘額</span><span class="v">${fmtMoney(bd.accBal)}</span></div>
+        <label class="chk-paid"><input type="checkbox" ${isPaid?'checked':''} onchange="togglePaid('${b.key}',this.checked)"/> 已繳費</label>
       </div>`;
     }
   });
+  h += `</div>`;
   document.getElementById('tab-content').innerHTML = h;
+}
+
+async function refreshDashboard() {
+  const btn = document.getElementById('dashRefreshBtn');
+  if (btn) btn.classList.add('spinning');
+  try {
+    await loadCurrentMonth();
+    notify('✓ 已更新', 'ok');
+  } catch (e) {
+    notify('重新整理失敗', 'err');
+  }
 }
 
 function getColorByCategory(cat) {
@@ -950,11 +1090,13 @@ function populateFormMonthSelector(disabled) {
 
 function openAddForm() {
   EDIT_TARGET = null;
-  populateFormMonthSelector(false); // 新增時可選月份
+  populateFormMonthSelector(false);
   document.getElementById('form-title').textContent = '新增記帳';
   document.getElementById('f-delete').classList.add('hidden');
-  document.getElementById('f-bank').value = '';
-  document.getElementById('f-bank').disabled = false;
+  document.getElementById('f-bankgroup').value = '';
+  document.getElementById('f-bankgroup').disabled = false;
+  document.getElementById('f-card-field').classList.add('hidden');
+  document.getElementById('f-card').innerHTML = '';
   document.getElementById('f-month').value = CURRENT_MONTH;
   // 日期預設今天
   const now = new Date();
@@ -967,16 +1109,22 @@ function openAddForm() {
   document.getElementById('form-modal').classList.remove('hidden');
 }
 
-function editEntry(bankKey, rowIdx) {
-  const items = MONTH_DATA[bankKey] || [];
+function editEntry(cardKey, rowIdx) {
+  const items = MONTH_DATA[cardKey] || [];
   const it = items.find(x => x.rowIdx === rowIdx);
   if (!it) return;
-  EDIT_TARGET = {bankKey, rowIdx};
-  populateFormMonthSelector(true); // 編輯時鎖住月份（因為列號是該月份的）
+  const card = BANKS_CARDS.find(c => c.key === cardKey);
+  if (!card) return;
+  EDIT_TARGET = {bankKey: cardKey, rowIdx};
+  populateFormMonthSelector(true);
   document.getElementById('form-title').textContent = '編輯記錄';
   document.getElementById('f-delete').classList.remove('hidden');
-  document.getElementById('f-bank').value = bankKey;
-  document.getElementById('f-bank').disabled = true;
+  document.getElementById('f-bankgroup').value = card.bankKey;
+  document.getElementById('f-bankgroup').disabled = true;
+  // 觸發卡別下拉填充
+  onBankGroupChange();
+  document.getElementById('f-card').value = cardKey;
+  document.getElementById('f-card').disabled = true;
   document.getElementById('f-month').value = CURRENT_MONTH;
   document.getElementById('f-date').value = mdToDate(it.date, CURRENT_MONTH);
   document.getElementById('f-amt').value = it.amount;
@@ -992,7 +1140,7 @@ function closeForm() {
 }
 
 async function saveEntry() {
-  const bankKey = document.getElementById('f-bank').value;
+  const bankKey = document.getElementById('f-card').value;
   if (!bankKey) return notify('請選擇記帳項目', 'err');
   const targetMonth = document.getElementById('f-month').value || CURRENT_MONTH;
   const dateRaw = document.getElementById('f-date').value;
@@ -1030,7 +1178,7 @@ async function saveEntry() {
       await loadCurrentMonth();
     } else {
       CURRENT_MONTH = targetMonth;
-      document.getElementById('month-sel').value = targetMonth;
+      csSetValue('cs-month-wrap', targetMonth);
       await loadCurrentMonth();
     }
   } catch (e) {
@@ -1216,24 +1364,30 @@ function renderPieContent() {
   const borderCol  = cs.getPropertyValue('--bg').trim()  || '#0F1418';
 
   // 建構 HTML
-  let h = `<div class="analysis-total-lbl">總消費金額（不含代墊）</div>`;
-  h += `<div class="analysis-total-val">${fmtMoney(grandTotal)}</div>`;
-  h += `<div class="ess-summary">
-    <div class="ess-card e">
-      <div class="ec-label">必須花費</div>
-      <div class="ec-val">${fmtMoney(essTotal)}</div>
-      <div class="ec-pct">${essPct}%</div>
+  let h = `<div class="analysis-pie-grid">
+    <div class="analysis-left">
+      <div class="analysis-total-lbl">總消費金額（不含代墊）</div>
+      <div class="analysis-total-val">${fmtMoney(grandTotal)}</div>
+      <div class="ess-summary">
+        <div class="ess-card e">
+          <div class="ec-label">必須花費</div>
+          <div class="ec-val">${fmtMoney(essTotal)}</div>
+          <div class="ec-pct">${essPct}%</div>
+        </div>
+        <div class="ess-card n">
+          <div class="ec-label">非必須花費</div>
+          <div class="ec-val">${fmtMoney(nessTotal)}</div>
+          <div class="ec-pct">${nessPct}%</div>
+        </div>
+      </div>
+      <div style="max-width:260px;margin:0 auto"><canvas id="pie-canvas"></canvas></div>
     </div>
-    <div class="ess-card n">
-      <div class="ec-label">非必須花費</div>
-      <div class="ec-val">${fmtMoney(nessTotal)}</div>
-      <div class="ec-pct">${nessPct}%</div>
-    </div>
-  </div>`;
-  h += `<div style="max-width:260px;margin:0 auto 16px"><canvas id="pie-canvas"></canvas></div>`;
+    <div class="analysis-right">`;
 
   if (essItems.length)  h += buildCatSection('必須花費明細',  'e', essItems,  essTotal,  grandTotal, ESS_COLORS);
   if (nessItems.length) h += buildCatSection('非必須花費明細', 'n', nessItems, nessTotal, grandTotal, NESS_COLORS);
+
+  h += `</div></div>`;
 
   panel.innerHTML = h;
 
