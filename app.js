@@ -4,26 +4,41 @@
 
 const CLIENT_ID = '144262693536-poq7p69eo0aqr3r0onjafrd2f1rfrmg3.apps.googleusercontent.com';
 const SCOPES = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file';
-const APP_VERSION = 'v1.4';
+const APP_VERSION = 'v1.6';
 
-// 銀行/卡片定義（依試算表欄位順序）
+// 9 個銀行（用於儀表板顯示與計算）
+// totalCol = 該銀行總計欄(row 56)；paidCol/accBalCol = 在 row 57 該銀行的「已匯入」「帳戶餘額」位置
+const BANKS = [
+  { key:'cash', name:'現金', isCash:true, totalCol:'A',  paidCol:'D',  accBalCol:'C',  dateInfo:'' },
+  { key:'fb',   name:'富邦', totalCol:'E',  paidCol:'L',  accBalCol:'K',  dateInfo:'結帳20/期限05' },
+  { key:'es',   name:'玉山', totalCol:'M',  paidCol:'AB', accBalCol:'AA', dateInfo:'結帳21/期限07' },
+  { key:'ub',   name:'聯邦', totalCol:'AC', paidCol:'AR', accBalCol:'AQ', dateInfo:'結帳22/期限07' },
+  { key:'cu',   name:'國泰', totalCol:'AS', paidCol:'AV', accBalCol:'AU', dateInfo:'結帳22/期限08' },
+  { key:'tx',   name:'台新', totalCol:'AW', paidCol:'AZ', accBalCol:'AY', dateInfo:'結帳22/期限09' },
+  { key:'sf',   name:'永豐', totalCol:'BA', paidCol:'BD', accBalCol:'BC', dateInfo:'結帳23/期限07' },
+  { key:'cb',   name:'彰銀', totalCol:'BE', paidCol:'BH', accBalCol:'BG', dateInfo:'月底結帳/期限18' },
+  { key:'cc',   name:'中信', totalCol:'BI', paidCol:'BL', accBalCol:'BK', dateInfo:'結帳20/期限08' },
+];
+
+// 16 個記帳項目（13 張卡 + 現金，依試算表欄位順序）
+// col = 日期欄；col+1=金額；col+2=備註；col+3=分類
 const BANKS_CARDS = [
-  {key:'cash', col:'A', bank:'現金', name:'現金', tag:'', isCash:true},
-  {key:'fb_2606', col:'E', bank:'富邦', name:'Open Possible', tag:'2606'},
-  {key:'fb_5389', col:'I', bank:'富邦', name:'好事多', tag:'5389'},
-  {key:'es_3473', col:'M', bank:'玉山', name:'熊卡', tag:'3473'},
-  {key:'es_2649', col:'Q', bank:'玉山', name:'Unicard', tag:'2649'},
-  {key:'es_3327', col:'U', bank:'玉山', name:'數位 e 卡', tag:'3327'},
-  {key:'es_3179', col:'Y', bank:'玉山', name:'南山', tag:'3179'},
-  {key:'ub_9207', col:'AC', bank:'聯邦', name:'Line Bank', tag:'9207'},
-  {key:'ub_6903', col:'AG', bank:'聯邦', name:'幸福 M', tag:'6903'},
-  {key:'ub_7602', col:'AK', bank:'聯邦', name:'綠卡', tag:'7602'},
-  {key:'ub_7207', col:'AO', bank:'聯邦', name:'吉鶴', tag:'7207'},
-  {key:'cu_3568', col:'AS', bank:'國泰', name:'Cube', tag:'3568'},
-  {key:'tx_0106', col:'AW', bank:'台新', name:'太陽', tag:'0106'},
-  {key:'sf_2207', col:'BA', bank:'永豐', name:'Daway', tag:'2207'},
-  {key:'cb_2108', col:'BE', bank:'彰銀', name:'My 購', tag:'2108'},
-  {key:'cc_3568', col:'BI', bank:'中信', name:'英雄聯盟', tag:'3568'},
+  {key:'cash',    col:'A',  bankKey:'cash', bank:'現金', name:'現金',         tag:'',     isCash:true},
+  {key:'fb_2606', col:'E',  bankKey:'fb',   bank:'富邦', name:'Open Possible',tag:'2606'},
+  {key:'fb_5389', col:'I',  bankKey:'fb',   bank:'富邦', name:'好事多',       tag:'5389'},
+  {key:'es_3473', col:'M',  bankKey:'es',   bank:'玉山', name:'熊卡',         tag:'3473'},
+  {key:'es_2649', col:'Q',  bankKey:'es',   bank:'玉山', name:'Unicard',      tag:'2649'},
+  {key:'es_3327', col:'U',  bankKey:'es',   bank:'玉山', name:'數位 e 卡',     tag:'3327'},
+  {key:'es_3179', col:'Y',  bankKey:'es',   bank:'玉山', name:'南山',         tag:'3179'},
+  {key:'ub_9207', col:'AC', bankKey:'ub',   bank:'聯邦', name:'Line Bank',    tag:'9207'},
+  {key:'ub_6903', col:'AG', bankKey:'ub',   bank:'聯邦', name:'幸福 M',       tag:'6903'},
+  {key:'ub_7602', col:'AK', bankKey:'ub',   bank:'聯邦', name:'綠卡',         tag:'7602'},
+  {key:'ub_7207', col:'AO', bankKey:'ub',   bank:'聯邦', name:'吉鶴',         tag:'7207'},
+  {key:'cu_3568', col:'AS', bankKey:'cu',   bank:'國泰', name:'Cube',         tag:'3568'},
+  {key:'tx_0106', col:'AW', bankKey:'tx',   bank:'台新', name:'太陽',         tag:'0106'},
+  {key:'sf_2207', col:'BA', bankKey:'sf',   bank:'永豐', name:'Daway',        tag:'2207'},
+  {key:'cb_2108', col:'BE', bankKey:'cb',   bank:'彰銀', name:'My 購',        tag:'2108'},
+  {key:'cc_3568', col:'BI', bankKey:'cc',   bank:'中信', name:'英雄聯盟',     tag:'3568'},
 ];
 
 // 9 種底色（位置 0=無 1-8=色）
@@ -73,12 +88,9 @@ let TOKEN_CLIENT = null;
 let CURRENT_USER = null;
 let CURRENT_MONTH = ''; // 'YY_MM'
 let CURRENT_TAB = 'dashboard';
-let MONTH_DATA = {}; // {bankKey:[{row,date,amount,note,category,color,installment}]}
-let CARD_PAID = {}; // {bankKey: true/false}
-let CARD_REBATE = {}; // {bankKey: number}
-let CARD_BALANCE = {}; // {bankKey: number}  (accBal - row57 倒數第二欄)
-let CARD_CASHIN = {}; // {bankKey: number}  (paid - row57 最右欄)
-let EDIT_TARGET = null; // {bankKey, row} for editing
+let MONTH_DATA = {}; // {cardKey: [{rowIdx, date, amount, note, category, installment}]}
+let BANK_DATA = {};  // {bankKey: {total, rebate, install, paid, accBalRaw, accBal, net, pending, isPaidCheck}}
+let EDIT_TARGET = null; // {bankKey(=cardKey), rowIdx} for editing
 let HISTORY_DATA = null; // 6 個月歷史
 
 // ─── 初始化 ──────────────────────────────────────────────────
@@ -511,7 +523,7 @@ function populateBankSelector() {
 
 function populateCategorySelector() {
   const sel = document.getElementById('f-cat');
-  sel.innerHTML = CATEGORIES.map(c => `<option value="${c.name}">${c.name}${c.essential?' ✓':''}</option>`).join('');
+  sel.innerHTML = CATEGORIES.map(c => `<option value="${c.name}">${c.name}</option>`).join('');
 }
 
 function populateColorPicker() {
@@ -546,10 +558,40 @@ async function onMonthChange() {
 async function loadCurrentMonth() {
   document.getElementById('tab-content').innerHTML = `<div style="text-align:center;padding:40px;color:var(--fg3)"><span class="loader"></span> 載入 ${CURRENT_MONTH}…</div>`;
   try {
-    // 一次抓整個月份分頁的核心區域 A4:BL57
-    const r = await sheetGet(SHEET_ID, `${CURRENT_MONTH}!A4:BL57`);
-    const rows = r.result.values || [];
-    parseMonthData(rows);
+    // 用 spreadsheets.get with grid data，一次抓「值」+「背景色」
+    const r = await retryWithAuth(() => gapi.client.sheets.spreadsheets.get({
+      spreadsheetId: SHEET_ID,
+      ranges: [`${CURRENT_MONTH}!A4:BL57`],
+      fields: 'sheets.data.rowData.values(formattedValue,effectiveValue,effectiveFormat.backgroundColor)',
+    }));
+    const sheetData = r.result.sheets?.[0]?.data?.[0];
+    const rowDataArr = sheetData?.rowData || [];
+
+    // 解析成 [54 列][64 欄] 的 values 與 backgrounds
+    const rows = []; // 值
+    const bgs = [];  // 背景色 {red,green,blue}
+    for (let i = 0; i < 54; i++) {
+      const cells = rowDataArr[i]?.values || [];
+      const rv = [], rb = [];
+      for (let j = 0; j < 64; j++) {
+        const cell = cells[j] || {};
+        const ev = cell.effectiveValue;
+        let v = '';
+        if (ev) {
+          if ('numberValue' in ev) v = ev.numberValue;
+          else if ('stringValue' in ev) v = ev.stringValue;
+          else if ('boolValue' in ev) v = ev.boolValue;
+        } else if (cell.formattedValue !== undefined) {
+          v = cell.formattedValue;
+        }
+        rv.push(v);
+        rb.push(cell.effectiveFormat?.backgroundColor || null);
+      }
+      rows.push(rv);
+      bgs.push(rb);
+    }
+
+    parseMonthData(rows, bgs);
     renderTab();
   } catch (e) {
     console.error('載入月份失敗', e);
@@ -561,52 +603,102 @@ async function loadCurrentMonth() {
   }
 }
 
-function parseMonthData(rows) {
+// 顏色判斷工具：判斷儲存格背景色
+function colorClose(bg, r, g, b, tol) {
+  if (!bg) return false;
+  tol = tol || 0.08;
+  return Math.abs((bg.red||0) - r) < tol &&
+         Math.abs((bg.green||0) - g) < tol &&
+         Math.abs((bg.blue||0) - b) < tol;
+}
+function isOrange(bg) { return colorClose(bg, 1, 0.6, 0); }       // #ff9900
+function isPaidGray(bg) { return colorClose(bg, 0.7176, 0.7176, 0.7176); } // #b7b7b7
+
+function parseMonthData(rows, bgs) {
   MONTH_DATA = {};
-  CARD_REBATE = {};
-  CARD_BALANCE = {};
-  CARD_CASHIN = {};
-  CARD_PAID = {};
-  // rows[0] = row 4 (first data row)
-  // rows[49] = row 53 (last data row)
-  // rows[50] = row 54 (rebate)
-  // rows[51] = row 55 (separator/blank)
-  // rows[52] = row 56 (total/paid checkbox)
-  // rows[53] = row 57 (paid + accBal)
-  BANKS_CARDS.forEach(b => {
-    const cIdx = colToIdx(b.col);
+  BANK_DATA = {};
+  bgs = bgs || [];
+  // rows[0] = row 4（第一筆資料）
+  // rows[49] = row 53（最後一筆資料）
+  // rows[50] = row 54（折抵）
+  // rows[51] = row 55（空白行）
+  // rows[52] = row 56（總計／已繳費勾選格 — 灰底=已繳費）
+  // rows[53] = row 57（已匯入 + 帳戶餘額）
+
+  // 1) 先以「卡」為單位讀條目，存入 MONTH_DATA[cardKey]
+  BANKS_CARDS.forEach(card => {
+    const cIdx = colToIdx(card.col);
+    const aIdx = cIdx + 1, nIdx = cIdx + 2, ccIdx = cIdx + 3;
     const items = [];
     for (let i = 0; i < 50; i++) {
       const r = rows[i] || [];
-      const date = r[cIdx] || '';
-      const amount = r[cIdx+1] || '';
-      const note = r[cIdx+2] || '';
-      const category = r[cIdx+3] || '';
-      if (!date && !amount && !note) continue;
-      const amt = parseAmount(amount);
-      if (amt === null && !date && !note) continue;
+      const date = r[cIdx] === '' || r[cIdx] == null ? '' : r[cIdx];
+      const amountRaw = r[aIdx];
+      const note = r[nIdx] || '';
+      const category = r[ccIdx] || '';
+      const amt = parseAmount(amountRaw);
+      if ((amt === null || amt === 0) && !date && !note) continue;
+      // 分期判斷：[分期] 標記 OR 金額儲存格背景色 #ff9900
+      const cellBg = (bgs[i] || [])[aIdx];
+      const isInstByNote = /\[分期\]/.test(String(note));
+      const isInstByBg = isOrange(cellBg);
       items.push({
-        rowIdx: i + 4, // 試算表的列號
+        rowIdx: i + 4,
         date,
         amount: amt || 0,
         note,
         category,
-        installment: /\[分期\]/.test(note),
+        installment: isInstByNote || isInstByBg,
       });
     }
-    MONTH_DATA[b.key] = items;
-    // Row 54 = rebate
-    const rebate = parseAmount((rows[50] || [])[cIdx+1]);
-    CARD_REBATE[b.key] = rebate || 0;
-    // Row 56 = total (we recalculate ourselves)
-    // Row 57 = paid (col+3) + accBal (col+2)
+    MONTH_DATA[card.key] = items;
+  });
+
+  // 2) 以「銀行」為單位計算彙總
+  BANKS.forEach(bank => {
+    const bankCards = BANKS_CARDS.filter(c => c.bankKey === bank.key);
+    let total = 0, rebate = 0, install = 0;
+
+    bankCards.forEach(card => {
+      const cIdx = colToIdx(card.col);
+      const aIdx = cIdx + 1;
+      // 加總所有條目（含負數刷退）
+      for (let i = 0; i < 50; i++) {
+        const r = rows[i] || [];
+        const n = parseAmount(r[aIdx]);
+        if (n === null || n === 0) continue;
+        total += n;
+        // 分期：[分期] 標記 OR 背景色 #ff9900；只算正數
+        const note = String(r[cIdx + 2] || '');
+        const cellBg = (bgs[i] || [])[aIdx];
+        if (n > 0 && (/\[分期\]/.test(note) || isOrange(cellBg))) {
+          install += n;
+        }
+      }
+      // Row 54 = 折抵
+      const rb = parseAmount((rows[50] || [])[aIdx]);
+      rebate += (rb || 0);
+    });
+
+    // 銀行的 paid 與 accBal 都在 row 57 的「銀行專屬欄位」
+    const paidIdx = colToIdx(bank.paidCol);
+    const accBalIdx = colToIdx(bank.accBalCol);
     const r57 = rows[53] || [];
-    CARD_BALANCE[b.key] = parseAmount(r57[cIdx+2]) || 0;
-    CARD_CASHIN[b.key] = parseAmount(r57[cIdx+3]) || 0;
-    // Paid checkbox: row 56, leftmost col
-    const r56 = rows[52] || [];
-    const paidVal = r56[cIdx];
-    CARD_PAID[b.key] = (paidVal === true || paidVal === 'TRUE' || paidVal === 'V' || paidVal === '✓');
+    const paid = parseAmount(r57[paidIdx]) || 0;
+    const accBalRaw = parseAmount(r57[accBalIdx]) || 0;
+    const accBal = accBalRaw < 0 ? Math.abs(accBalRaw) : 0;
+    const net = total - rebate;
+    const pending = Math.max(0, net - paid);
+
+    // 已繳費判斷：totalCol+'56' 的背景色為 #b7b7b7
+    const totalIdx = colToIdx(bank.totalCol);
+    const r56bg = (bgs[52] || [])[totalIdx];
+    const isPaidCheck = isPaidGray(r56bg);
+
+    BANK_DATA[bank.key] = {
+      total, rebate, install, paid, accBalRaw, accBal,
+      net, pending, isPaidCheck
+    };
   });
 }
 
@@ -677,156 +769,93 @@ function switchTab(tab) {
 
 function renderTab() {
   if (CURRENT_TAB === 'dashboard') renderDashboard();
-  else if (CURRENT_TAB === 'cards') renderCards();
   else if (CURRENT_TAB === 'analysis') renderAnalysis();
   else if (CURRENT_TAB === 'trends') renderTrends();
 }
 
 // ─── 計算函式 ────────────────────────────────────────────────
-function getBankTotal(bankKey) {
-  const items = MONTH_DATA[bankKey] || [];
+function getCardTotal(cardKey) {
+  const items = MONTH_DATA[cardKey] || [];
   return items.reduce((s, it) => s + it.amount, 0);
-}
-function getBankInstallment(bankKey) {
-  const items = MONTH_DATA[bankKey] || [];
-  return items.filter(it => it.installment).reduce((s, it) => s + it.amount, 0);
 }
 
 // ─── 儀表板 ──────────────────────────────────────────────────
 function renderDashboard() {
-  let totalSpend = 0, totalRebate = 0, totalCashIn = 0, totalUnpaid = 0, totalBalance = 0, totalInstallment = 0;
-  BANKS_CARDS.forEach(b => {
-    const total = getBankTotal(b.key);
-    const rebate = CARD_REBATE[b.key] || 0;
-    const installment = getBankInstallment(b.key);
-    totalSpend += total;
-    totalRebate += rebate;
-    totalInstallment += installment;
+  // 全域加總（嚴格對應舊版 GAS 邏輯）
+  let gTotal = 0, gRebate = 0, gPaid = 0, gPending = 0, gInstall = 0, gAccBalAccum = 0;
+
+  BANKS.forEach(b => {
+    const bd = BANK_DATA[b.key];
+    if (!bd) return;
+    gTotal += bd.total;
+    gRebate += bd.rebate;
+    gInstall += bd.install;
     if (b.isCash) {
-      totalBalance += CARD_BALANCE[b.key] || 0;
+      // 現金的 paid (D57) 是現金餘額本身
+      gAccBalAccum += bd.paid;
     } else {
-      totalCashIn += CARD_CASHIN[b.key] || 0;
-      totalBalance += CARD_BALANCE[b.key] || 0;
-      // 待匯入 = 該卡實付 - 已匯入
-      const actualPay = total - rebate;
-      const unpaid = Math.max(0, actualPay - (CARD_CASHIN[b.key] || 0));
-      if (!CARD_PAID[b.key]) totalUnpaid += unpaid;
+      gPaid += bd.paid;
+      gPending += bd.pending;
+      gAccBalAccum += bd.accBal; // 各卡的「透支金額」(rawAcc<0 時的絕對值)
     }
   });
-  const actualPayable = totalSpend - totalRebate;
+  const gNet = gTotal - gRebate;
+  // 最終：(現金 + 各卡透支) - 待匯入繳款
+  const gAccBalTotal = gAccBalAccum - gPending;
 
+  // KPI
   let h = '<div class="kpi-grid">';
-  h += `<div class="kpi-card"><div class="kpi-label">消費總計</div><div class="kpi-value">${fmtMoney(totalSpend)}</div></div>`;
-  h += `<div class="kpi-card"><div class="kpi-label">回饋折抵</div><div class="kpi-value green">${fmtMoney(totalRebate)}</div></div>`;
-  h += `<div class="kpi-card"><div class="kpi-label">實際應付</div><div class="kpi-value">${fmtMoney(actualPayable)}</div></div>`;
-  h += `<div class="kpi-card"><div class="kpi-label">已匯入現金</div><div class="kpi-value blue">${fmtMoney(totalCashIn)}</div></div>`;
-  h += `<div class="kpi-card"><div class="kpi-label">待匯入繳款</div><div class="kpi-value red">${fmtMoney(totalUnpaid)}</div></div>`;
-  h += `<div class="kpi-card"><div class="kpi-label">本月分期</div><div class="kpi-value orange">${fmtMoney(totalInstallment)}</div></div>`;
+  h += `<div class="kpi-card"><div class="kpi-label">消費總計</div><div class="kpi-value">${fmtMoney(gTotal)}</div></div>`;
+  h += `<div class="kpi-card"><div class="kpi-label">回饋折抵</div><div class="kpi-value green">-${fmtMoney(gRebate)}</div></div>`;
+  h += `<div class="kpi-card"><div class="kpi-label">實際應付</div><div class="kpi-value">${fmtMoney(gNet)}</div></div>`;
+  h += `<div class="kpi-card"><div class="kpi-label">已匯入現金</div><div class="kpi-value blue">${fmtMoney(gPaid)}</div></div>`;
+  h += `<div class="kpi-card"><div class="kpi-label">待匯入繳款</div><div class="kpi-value red">${fmtMoney(gPending)}</div></div>`;
+  h += `<div class="kpi-card"><div class="kpi-label">本月分期</div><div class="kpi-value orange">${fmtMoney(gInstall)}</div></div>`;
   h += `</div>`;
-  h += `<div class="card"><div class="card-title">現金及帳戶餘額</div><div class="card-value ${totalBalance < 0 ? 'red' : ''}">${fmtMoney(totalBalance)}</div><div class="card-sub">${totalBalance < 0 ? '⚠ 透支' : '可用餘額'}</div></div>`;
+  h += `<div class="card"><div class="card-title">現金及帳戶餘額</div><div class="card-value ${gAccBalTotal < 0 ? 'red' : ''}">${fmtMoney(gAccBalTotal)}</div><div class="card-sub">${gAccBalTotal < 0 ? '⚠ 透支' : '可用餘額'}</div></div>`;
 
-  // 各銀行摘要（只有信用卡）
-  h += `<div style="margin-top:14px;font-size:13px;font-weight:600;color:var(--fg2);margin-bottom:8px">各卡摘要</div>`;
-  BANKS_CARDS.filter(b => !b.isCash).forEach(b => {
-    const total = getBankTotal(b.key);
-    if (total === 0 && (CARD_REBATE[b.key] || 0) === 0) return;
-    const rebate = CARD_REBATE[b.key] || 0;
-    const cashIn = CARD_CASHIN[b.key] || 0;
-    const balance = CARD_BALANCE[b.key] || 0;
-    const installment = getBankInstallment(b.key);
-    const actualPay = total - rebate;
-    const unpaid = Math.max(0, actualPay - cashIn);
-    const paid = !!CARD_PAID[b.key];
-    h += `<div class="card-row ${paid?'paid':''}">
-      <div class="card-row-head">
-        <div class="card-row-name">
-          <span>${b.bank} · ${b.name}</span>
-          <span class="card-row-tag">${b.tag}</span>
+  // 各銀行摘要
+  h += `<div style="margin-top:14px;font-size:13px;font-weight:600;color:var(--fg2);margin-bottom:8px">各銀行摘要</div>`;
+
+  BANKS.forEach(b => {
+    const bd = BANK_DATA[b.key];
+    if (!bd) return;
+    if (bd.total === 0 && bd.paid === 0 && bd.install === 0) return;
+
+    if (b.isCash) {
+      h += `<div class="card-row">
+        <div class="card-row-head">
+          <div class="card-row-name"><span>${b.name}</span></div>
+          <div class="card-row-amt">${fmtMoney(bd.total)}</div>
         </div>
-        <div class="card-row-amt">${fmtMoney(total)}</div>
-      </div>
-      <div class="card-row-meta">
-        ${rebate?`<span>折抵 <b class="green">${fmtMoney(rebate)}</b></span>`:''}
-        <span>應付 <b>${fmtMoney(actualPay)}</b></span>
-        ${cashIn?`<span>已匯 <b class="blue">${fmtMoney(cashIn)}</b></span>`:''}
-        ${installment?`<span>分期 <b class="orange">${fmtMoney(installment)}</b></span>`:''}
-        ${!paid && unpaid?`<span>待繳 <b class="red">${fmtMoney(unpaid)}</b></span>`:''}
-        ${balance?`<span>餘額 <b>${fmtMoney(balance)}</b></span>`:''}
-      </div>
-      <div class="card-row-actions">
-        <label class="chk-paid"><input type="checkbox" ${paid?'checked':''} onchange="togglePaid('${b.key}',this.checked)"/> 已繳費</label>
-        <button class="btn-mini" onclick="viewBank('${b.key}')">查看明細</button>
-      </div>
-    </div>`;
-  });
-  document.getElementById('tab-content').innerHTML = h;
-}
-
-function viewBank(bankKey) {
-  CURRENT_TAB = 'cards';
-  document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === 'cards'));
-  renderCards(bankKey);
-}
-
-// ─── 各卡明細 ────────────────────────────────────────────────
-function renderCards(focusBank = null) {
-  let h = '';
-  const cardsToShow = focusBank ? BANKS_CARDS.filter(b => b.key === focusBank) : BANKS_CARDS;
-  if (focusBank) {
-    h += `<div style="margin-bottom:10px"><button class="btn-mini" onclick="renderCards()">← 顯示全部</button></div>`;
-  }
-  cardsToShow.forEach(b => {
-    const items = MONTH_DATA[b.key] || [];
-    const total = getBankTotal(b.key);
-    if (!items.length && !focusBank) return;
-    const rebate = CARD_REBATE[b.key] || 0;
-    const installment = getBankInstallment(b.key);
-    const paid = !!CARD_PAID[b.key];
-    const isCash = b.isCash;
-    h += `<div class="card-row ${paid?'paid':''}">
-      <div class="card-row-head">
-        <div class="card-row-name">
-          <span>${b.bank} · ${b.name}</span>
-          ${b.tag?`<span class="card-row-tag">${b.tag}</span>`:''}
+        <div class="card-row-meta">
+          <span>消費總計 <b>${fmtMoney(bd.total)}</b></span>
+          <span>目前現金 <b class="green">${fmtMoney(bd.paid)}</b></span>
         </div>
-        <div class="card-row-amt">${fmtMoney(total)}</div>
-      </div>
-      <div class="card-row-meta">
-        <span>${items.length} 筆</span>
-        ${rebate?`<span>折抵 <b class="green">${fmtMoney(rebate)}</b></span>`:''}
-        ${installment?`<span>分期 <b class="orange">${fmtMoney(installment)}</b></span>`:''}
       </div>`;
-    if (items.length) {
-      h += `<div class="expense-list">`;
-      items.sort((a,b) => {
-        const da = parseDateMD(a.date), db = parseDateMD(b.date);
-        return db - da;
-      });
-      items.forEach(it => {
-        const colorClass = `color-${getColorByCategory(it.category)}`;
-        h += `<div class="expense-row ${it.installment?'installment':colorClass}" onclick="editEntry('${b.key}',${it.rowIdx})">
-          <div class="exp-date">${escapeHtml(it.date)}</div>
-          <div class="exp-info">
-            <div class="exp-note">${escapeHtml(it.note)}</div>
-            <div class="exp-cat">${escapeHtml(it.category)}</div>
+    } else {
+      h += `<div class="card-row ${bd.isPaidCheck?'paid':''}">
+        <div class="card-row-head">
+          <div class="card-row-name">
+            <span>${b.name}</span>
+            ${b.dateInfo?`<span class="card-row-tag">${b.dateInfo}</span>`:''}
           </div>
-          <div class="exp-amt ${it.amount < 0 ? 'neg' : ''}">${fmtMoney(it.amount)}</div>
-        </div>`;
-      });
-      h += `</div>`;
-    } else if (focusBank) {
-      h += `<div class="empty" style="padding:20px"><p>本月還沒有記錄</p></div>`;
-    }
-    if (!isCash) {
-      h += `<div class="card-row-actions" style="margin-top:8px">
-        <label class="chk-paid"><input type="checkbox" ${paid?'checked':''} onchange="togglePaid('${b.key}',this.checked)"/> 已繳費</label>
+          <div class="card-row-amt">${fmtMoney(bd.total)}</div>
+        </div>
+        <div class="card-row-meta">
+          ${bd.install ? `<span>分期 <b class="orange">${fmtMoney(bd.install)}</b></span>` : ''}
+          ${bd.rebate ? `<span>折抵 <b class="green">-${fmtMoney(bd.rebate)}</b></span>` : ''}
+          ${bd.rebate ? `<span>繳款 <b>${fmtMoney(bd.net)}</b></span>` : ''}
+          <span>已匯 <b class="blue">${fmtMoney(bd.paid)}</b></span>
+          <span>待繳 <b class="${bd.pending>0?'red':'green'}">${fmtMoney(bd.pending)}</b></span>
+          <span>餘額 <b>${fmtMoney(bd.accBal)}</b></span>
+        </div>
+        <div class="card-row-actions">
+          <label class="chk-paid"><input type="checkbox" ${bd.isPaidCheck?'checked':''} onchange="togglePaid('${b.key}',this.checked)"/> 已繳費</label>
+        </div>
       </div>`;
     }
-    h += `</div>`;
   });
-  if (!h.trim()) {
-    h = `<div class="empty"><div class="empty-icon">📭</div><p>本月還沒有記錄<br>點右下角 + 開始記帳</p></div>`;
-  }
   document.getElementById('tab-content').innerHTML = h;
 }
 
@@ -843,67 +872,84 @@ function parseDateMD(s) {
   return parseInt(m[1]) * 100 + parseInt(m[2]);
 }
 
-// ─── 切換已繳費 ──────────────────────────────────────────────
+// ─── 切換已繳費（以「銀行」為單位，寫入 totalCol+'56' 的背景色）──
 async function togglePaid(bankKey, checked) {
-  const bank = BANKS_CARDS.find(b => b.key === bankKey);
+  const bank = BANKS.find(b => b.key === bankKey);
   if (!bank) return;
-  CARD_PAID[bankKey] = checked;
-  // Row 56, 該卡左欄寫入勾選
-  const range = `${CURRENT_MONTH}!${bank.col}56`;
+  if (BANK_DATA[bankKey]) BANK_DATA[bankKey].isPaidCheck = checked;
   try {
-    await sheetUpdate(SHEET_ID, range, [[checked ? 'TRUE' : '']]);
-    // 套用灰底
-    await applyPaidStyle(bankKey, checked);
-    notify(checked ? '✓ 已標記繳費' : '已取消繳費標記', 'ok');
-    renderTab();
-  } catch (e) {
-    notify('更新失敗', 'err');
-    console.error(e);
-    CARD_PAID[bankKey] = !checked;
-    renderTab();
-  }
-}
-
-async function applyPaidStyle(bankKey, paid) {
-  // Row 56 整個銀行的範圍變灰底
-  try {
-    const bank = BANKS_CARDS.find(b => b.key === bankKey);
-    if (!bank) return;
-    const startCol = colToIdx(bank.col);
-    const endCol = startCol + 4;
     // 取得該分頁的 sheetId
     const meta = await gapi.client.sheets.spreadsheets.get({spreadsheetId: SHEET_ID});
     const sheet = meta.result.sheets.find(s => s.properties.title === CURRENT_MONTH);
-    if (!sheet) return;
+    if (!sheet) throw new Error('找不到月份分頁');
     const sheetId = sheet.properties.sheetId;
-    const color = paid ? {red:0.72,green:0.72,blue:0.72} : null; // #b7b7b7 or reset
+    const totalIdx = colToIdx(bank.totalCol);
+    const bgColor = checked ? {red:0.7176, green:0.7176, blue:0.7176} : {red:1, green:1, blue:1}; // #b7b7b7 or white
+
     await retryWithAuth(() => gapi.client.sheets.spreadsheets.batchUpdate({
       spreadsheetId: SHEET_ID,
       resource: {
         requests: [{
           repeatCell: {
-            range: {sheetId, startRowIndex: 55, endRowIndex: 56, startColumnIndex: startCol, endColumnIndex: endCol},
-            cell: paid ? {userEnteredFormat: {backgroundColor: color}} : {userEnteredFormat: {backgroundColor: {red:1,green:1,blue:1}}},
+            range: {sheetId, startRowIndex: 55, endRowIndex: 56, startColumnIndex: totalIdx, endColumnIndex: totalIdx + 1},
+            cell: {userEnteredFormat: {backgroundColor: bgColor}},
             fields: 'userEnteredFormat.backgroundColor',
           }
         }]
       }
     }));
+    notify(checked ? '✓ 已標記繳費' : '已取消繳費標記', 'ok');
+    renderTab();
   } catch (e) {
-    console.warn('套用灰底失敗', e);
+    notify('更新失敗', 'err');
+    console.error(e);
+    if (BANK_DATA[bankKey]) BANK_DATA[bankKey].isPaidCheck = !checked;
+    renderTab();
   }
 }
 
 // ─── 新增/編輯 ──────────────────────────────────────────────
+// 日期轉換工具
+function dateToMD(yyyymmdd) {
+  // YYYY-MM-DD → M/D
+  if (!yyyymmdd) return '';
+  const parts = yyyymmdd.split('-');
+  if (parts.length !== 3) return '';
+  return `${parseInt(parts[1])}/${parseInt(parts[2])}`;
+}
+function mdToDate(md, refMonth) {
+  // M/D → YYYY-MM-DD（年份從 refMonth 推算）
+  if (!md) return '';
+  const m = String(md).match(/(\d+)\/(\d+)/);
+  if (!m) return '';
+  let year = new Date().getFullYear();
+  if (refMonth) {
+    const [yy] = refMonth.split('_');
+    year = 2000 + parseInt(yy);
+  }
+  return `${year}-${String(m[1]).padStart(2,'0')}-${String(m[2]).padStart(2,'0')}`;
+}
+
+function populateFormMonthSelector(disabled) {
+  const sel = document.getElementById('f-month');
+  sel.innerHTML = (window.AVAILABLE_MONTHS || []).map(m => {
+    const [yy, mm] = m.split('_');
+    return `<option value="${m}">20${yy}/${mm}</option>`;
+  }).join('');
+  sel.disabled = !!disabled;
+}
+
 function openAddForm() {
   EDIT_TARGET = null;
+  populateFormMonthSelector(false); // 新增時可選月份
   document.getElementById('form-title').textContent = '新增記帳';
   document.getElementById('f-delete').classList.add('hidden');
   document.getElementById('f-bank').value = '';
   document.getElementById('f-bank').disabled = false;
-  // 預填今天日期
+  document.getElementById('f-month').value = CURRENT_MONTH;
+  // 日期預設今天
   const now = new Date();
-  document.getElementById('f-date').value = `${now.getMonth()+1}/${now.getDate()}`;
+  document.getElementById('f-date').value = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
   document.getElementById('f-amt').value = '';
   document.getElementById('f-note').value = '';
   document.getElementById('f-cat').value = CATEGORIES[0]?.name || '';
@@ -917,13 +963,14 @@ function editEntry(bankKey, rowIdx) {
   const it = items.find(x => x.rowIdx === rowIdx);
   if (!it) return;
   EDIT_TARGET = {bankKey, rowIdx};
+  populateFormMonthSelector(true); // 編輯時鎖住月份（因為列號是該月份的）
   document.getElementById('form-title').textContent = '編輯記錄';
   document.getElementById('f-delete').classList.remove('hidden');
   document.getElementById('f-bank').value = bankKey;
-  document.getElementById('f-bank').disabled = true; // 不能換卡
-  document.getElementById('f-date').value = it.date;
+  document.getElementById('f-bank').disabled = true;
+  document.getElementById('f-month').value = CURRENT_MONTH;
+  document.getElementById('f-date').value = mdToDate(it.date, CURRENT_MONTH);
   document.getElementById('f-amt').value = it.amount;
-  // 移除 [分期] 標籤顯示乾淨備註
   document.getElementById('f-note').value = (it.note || '').replace(/\s*\[分期\]\s*/g, '').trim();
   document.getElementById('f-cat').value = it.category || '';
   document.getElementById('f-installment').checked = it.installment;
@@ -938,7 +985,10 @@ function closeForm() {
 async function saveEntry() {
   const bankKey = document.getElementById('f-bank').value;
   if (!bankKey) return notify('請選擇記帳項目', 'err');
-  const date = document.getElementById('f-date').value.trim();
+  const targetMonth = document.getElementById('f-month').value || CURRENT_MONTH;
+  const dateRaw = document.getElementById('f-date').value;
+  if (!dateRaw) return notify('請選擇日期', 'err');
+  const date = dateToMD(dateRaw);
   const amt = document.getElementById('f-amt').value;
   if (!amt) return notify('請輸入金額', 'err');
   let note = document.getElementById('f-note').value.trim();
@@ -952,21 +1002,28 @@ async function saveEntry() {
   if (!rowIdx) return notify('該卡 50 筆已滿，請刪除舊記錄', 'err');
 
   const startCol = bank.col;
-  const range = `${CURRENT_MONTH}!${startCol}${rowIdx}:${idxToCol(colToIdx(startCol)+3)}${rowIdx}`;
+  const range = `${targetMonth}!${startCol}${rowIdx}:${idxToCol(colToIdx(startCol)+3)}${rowIdx}`;
   const btn = document.getElementById('f-save');
   btn.disabled = true;
   btn.innerHTML = '<span class="loader"></span> 儲存中…';
   try {
     await sheetUpdate(SHEET_ID, range, [[date, parseFloat(amt), note, category]]);
-    // 套用底色
-    await applyRowColor(bankKey, rowIdx, installment ? 2 : SELECTED_COLOR);
-    // 同步「共同飲食」
+    // 套用底色（用 targetMonth 不是 CURRENT_MONTH）
+    await applyRowColor(bankKey, rowIdx, installment ? 2 : SELECTED_COLOR, targetMonth);
+    // 同步「共同飲食」（也用 targetMonth）
     if (category === '共同飲食') {
-      await syncCommonFood(rowIdx, date, parseFloat(amt), note);
+      await syncCommonFood(rowIdx, date, parseFloat(amt), note, targetMonth);
     }
     notify('✓ 已儲存', 'ok');
     closeForm();
-    await loadCurrentMonth();
+    // 若寫入的月份就是當前顯示的月份，重新載入；否則切換過去
+    if (targetMonth === CURRENT_MONTH) {
+      await loadCurrentMonth();
+    } else {
+      CURRENT_MONTH = targetMonth;
+      document.getElementById('month-sel').value = targetMonth;
+      await loadCurrentMonth();
+    }
   } catch (e) {
     console.error(e);
     notify('儲存失敗：' + (e?.result?.error?.message || e?.message || '未知錯誤'), 'err');
@@ -983,13 +1040,14 @@ function findEmptyRow(bankKey) {
   return null;
 }
 
-async function applyRowColor(bankKey, rowIdx, colorId) {
+async function applyRowColor(bankKey, rowIdx, colorId, monthOverride) {
   const color = COLORS.find(c => c.id === colorId);
   if (!color) return;
+  const month = monthOverride || CURRENT_MONTH;
   try {
     const bank = BANKS_CARDS.find(b => b.key === bankKey);
     const meta = await gapi.client.sheets.spreadsheets.get({spreadsheetId: SHEET_ID});
-    const sheet = meta.result.sheets.find(s => s.properties.title === CURRENT_MONTH);
+    const sheet = meta.result.sheets.find(s => s.properties.title === month);
     if (!sheet) return;
     const sheetId = sheet.properties.sheetId;
     const startCol = colToIdx(bank.col);
@@ -1036,10 +1094,10 @@ async function deleteEntry() {
   }
 }
 
-async function syncCommonFood(srcRow, date, amount, note) {
-  // 找 E59:G86 第一個空白列寫入
+async function syncCommonFood(srcRow, date, amount, note, monthOverride) {
+  const month = monthOverride || CURRENT_MONTH;
   try {
-    const r = await sheetGet(SHEET_ID, `${CURRENT_MONTH}!E59:G86`);
+    const r = await sheetGet(SHEET_ID, `${month}!E59:G86`);
     const rows = r.result.values || [];
     let targetRow = -1;
     for (let i = 0; i < 28; i++) {
@@ -1049,8 +1107,8 @@ async function syncCommonFood(srcRow, date, amount, note) {
         break;
       }
     }
-    if (targetRow < 0) return; // 沒空位就跳過
-    await sheetUpdate(SHEET_ID, `${CURRENT_MONTH}!E${targetRow}:G${targetRow}`, [[date, amount, note]]);
+    if (targetRow < 0) return;
+    await sheetUpdate(SHEET_ID, `${month}!E${targetRow}:G${targetRow}`, [[date, amount, note]]);
   } catch (e) {
     console.warn('同步共同飲食失敗', e);
   }
@@ -1093,12 +1151,13 @@ function renderAnalysis() {
   </div>`;
   h += '</div>';
 
-  // 各分類詳細
+  // 各分類詳細（依舊版邏輯：淨額<=0 的分類不顯示）
+  const catEntries = Object.entries(catTotals).filter(([cat,amt]) => amt > 0).sort((a,b) => b[1]-a[1]);
   h += '<div class="chart-wrap">';
   h += '<div class="chart-title">分類明細</div>';
   h += '<table>';
   h += '<tr><th>分類</th><th class="r">金額</th><th class="r">佔比</th></tr>';
-  Object.entries(catTotals).sort((a,b) => b[1]-a[1]).forEach(([cat, amt]) => {
+  catEntries.forEach(([cat, amt]) => {
     const isEss = CATEGORIES.find(x => x.name === cat)?.essential;
     h += `<tr>
       <td>${escapeHtml(cat)} ${isEss?'<span style="color:var(--blue);font-size:10px">必須</span>':''}</td>
@@ -1140,14 +1199,17 @@ function drawDonut(id, data) {
     ctx.fill();
     start += slice;
   });
-  // 中心文字
-  ctx.fillStyle = '#E8E9EC';
+  // 中心文字（讀取 CSS 變數以適配主題）
+  const styles = getComputedStyle(document.documentElement);
+  const fgColor = styles.getPropertyValue('--fg').trim() || '#E8E9EC';
+  const fg2Color = styles.getPropertyValue('--fg2').trim() || '#A8AEB6';
+  ctx.fillStyle = fgColor;
   ctx.font = 'bold 18px sans-serif';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillText(fmtMoney(total), cx, cy-8);
   ctx.font = '11px sans-serif';
-  ctx.fillStyle = '#A8AEB6';
+  ctx.fillStyle = fg2Color;
   ctx.fillText('總計', cx, cy+12);
 }
 
@@ -1223,8 +1285,14 @@ function drawTrendLine(trends) {
     {key:'must', color:'#5B9BD5'},
     {key:'notMust', color:'#FF9900'},
   ];
+  // 主題色
+  const styles = getComputedStyle(document.documentElement);
+  const fg2Color = styles.getPropertyValue('--fg2').trim() || '#A8AEB6';
+  const fg3Color = styles.getPropertyValue('--fg3').trim() || '#6B7480';
+  const bg3Color = styles.getPropertyValue('--bg3').trim() || '#262E36';
+
   // X axis labels
-  ctx.fillStyle = '#A8AEB6';
+  ctx.fillStyle = fg2Color;
   ctx.font = '10px sans-serif';
   ctx.textAlign = 'center';
   trends.forEach((t, i) => {
@@ -1233,7 +1301,7 @@ function drawTrendLine(trends) {
     ctx.fillText(`${yy}/${mm}`, x, H - padB + 14);
   });
   // Grid lines
-  ctx.strokeStyle = '#262E36';
+  ctx.strokeStyle = bg3Color;
   ctx.lineWidth = 1;
   for (let i = 0; i <= 4; i++) {
     const y = padT + (i/4) * h;
@@ -1241,7 +1309,7 @@ function drawTrendLine(trends) {
     ctx.moveTo(padL, y);
     ctx.lineTo(W-padR, y);
     ctx.stroke();
-    ctx.fillStyle = '#6B7480';
+    ctx.fillStyle = fg3Color;
     ctx.textAlign = 'right';
     ctx.fillText(fmtMoneyShort(maxV * (1 - i/4)), padL-4, y+3);
   }
@@ -1304,9 +1372,30 @@ function openMenu() {
     const isStandalone = window.matchMedia('(display-mode: standalone)').matches || window.navigator.standalone === true;
     installBtn.style.display = isStandalone ? 'none' : '';
   }
+  // 主題按鈕標籤
+  const themeBtn = document.getElementById('menu-theme-btn');
+  if (themeBtn) {
+    const isLight = document.documentElement.classList.contains('light');
+    themeBtn.innerHTML = isLight ? '🌙 切換為深色模式' : '☀ 切換為淺色模式';
+  }
   document.getElementById('menu-modal').classList.remove('hidden');
 }
 function closeMenu() { document.getElementById('menu-modal').classList.add('hidden'); }
+
+function toggleTheme() {
+  const isLight = document.documentElement.classList.toggle('light');
+  localStorage.setItem('theme', isLight ? 'light' : 'dark');
+  // 更新 status bar 主題色
+  const meta = document.querySelector('meta[name="theme-color"]');
+  if (meta) meta.setAttribute('content', isLight ? '#FFFFFF' : '#534AB7');
+  // 更新選單按鈕標籤
+  const themeBtn = document.getElementById('menu-theme-btn');
+  if (themeBtn) themeBtn.innerHTML = isLight ? '🌙 切換為深色模式' : '☀ 切換為淺色模式';
+  // 重新繪圖表（圖表用 canvas，需重畫才會吃到新色）
+  if (CURRENT_TAB === 'analysis' || CURRENT_TAB === 'trends') {
+    setTimeout(() => renderTab(), 100);
+  }
+}
 
 async function reloadAll() {
   await loadCategories();

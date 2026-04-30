@@ -9,6 +9,13 @@
 <meta name="apple-mobile-web-app-title" content="信用卡記帳">
 <meta name="theme-color" content="#534AB7">
 <title>信用卡記帳</title>
+<!-- 主題切換：在最早期套用，避免閃爍 -->
+<script>
+  (function(){
+    var t = localStorage.getItem('theme') || 'dark';
+    if (t === 'light') document.documentElement.classList.add('light');
+  })();
+</script>
 <!-- ⚠️ 必須在所有其他 script 之前捕捉 beforeinstallprompt，否則手機版會錯過事件 -->
 <script>
   window._pwaPrompt = null;
@@ -42,6 +49,15 @@
   --r:10px;--r2:14px;
   --shadow:0 4px 16px rgba(0,0,0,.3);
 }
+:root.light{
+  --bg:#F5F6FA;--bg2:#FFFFFF;--bg3:#EDEFF3;--bg4:#DCE0E8;
+  --fg:#1A1F2E;--fg2:#4A5466;--fg3:#8089A0;
+  --shadow:0 4px 16px rgba(0,0,0,.06);
+}
+:root.light .expense-row{background:#FAFBFD}
+:root.light input,:root.light select,:root.light textarea{background:#FAFBFD!important;color:var(--fg)!important}
+:root.light .modal{box-shadow:0 -8px 32px rgba(0,0,0,.1)}
+:root.light .topbar{box-shadow:0 1px 0 var(--bg3)}
 body{font-family:-apple-system,'PingFang TC','Noto Sans TC',sans-serif;background:var(--bg);color:var(--fg);min-height:100vh;font-size:14px;padding-bottom:env(safe-area-inset-bottom)}
 .hidden{display:none!important}
 button{font-family:inherit;cursor:pointer;border:none;background:none;color:inherit}
@@ -285,7 +301,6 @@ td.r,th.r{text-align:right}
 
     <div class="tabs">
       <button class="tab-btn active" data-tab="dashboard" onclick="switchTab('dashboard')">儀表板</button>
-      <button class="tab-btn" data-tab="cards" onclick="switchTab('cards')">各卡明細</button>
       <button class="tab-btn" data-tab="analysis" onclick="switchTab('analysis')">消費分析</button>
       <button class="tab-btn" data-tab="trends" onclick="switchTab('trends')">歷史趨勢</button>
     </div>
@@ -305,6 +320,10 @@ td.r,th.r{text-align:right}
     <h2 id="form-title">新增記帳</h2>
     <div class="form-section">
       <div class="field">
+        <label>月份分頁</label>
+        <select class="inp" id="f-month"></select>
+      </div>
+      <div class="field">
         <label>記帳項目</label>
         <select class="inp" id="f-bank">
           <option value="">— 請選擇 —</option>
@@ -312,11 +331,11 @@ td.r,th.r{text-align:right}
       </div>
       <div class="field">
         <label>日期</label>
-        <input class="inp" id="f-date" type="text" placeholder="例：4/26"/>
+        <input class="inp" id="f-date" type="date"/>
       </div>
       <div class="field">
         <label>金額（負數=刷退）</label>
-        <input class="inp" id="f-amt" type="number" step="1" placeholder="例：350 或 -100"/>
+        <input class="inp" id="f-amt" type="number" step="1" placeholder="例：350 或 -100" inputmode="numeric"/>
       </div>
       <div class="field">
         <label>備註 / 帳務資訊</label>
@@ -352,6 +371,7 @@ td.r,th.r{text-align:right}
     <h2>選單</h2>
     <div style="display:flex;flex-direction:column;gap:8px">
       <button class="btn btn-primary btn-full" id="menu-install-btn" onclick="closeMenu();handleInstallClick()" style="display:none">📲 安裝為 App（加入主畫面）</button>
+      <button class="btn btn-ghost btn-full" id="menu-theme-btn" onclick="toggleTheme()">🌙 切換深色 / 淺色</button>
       <button class="btn btn-ghost btn-full" onclick="closeMenu();openSheet()">📊 開啟 Google 試算表</button>
       <button class="btn btn-ghost btn-full" onclick="closeMenu();reloadAll()">🔄 重新載入資料</button>
       <button class="btn btn-ghost btn-full" onclick="closeMenu();openSetupAgain()">⚙ 變更試算表</button>
@@ -409,6 +429,6 @@ td.r,th.r{text-align:right}
 <!-- Google APIs -->
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 <script src="https://apis.google.com/js/api.js" async defer></script>
-<script src="app.js?v=1.4"></script>
+<script src="app.js?v=1.6"></script>
 </body>
 </html>
