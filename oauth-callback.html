@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>登入處理中…</title>
+<style>
+  body{margin:0;font-family:-apple-system,"PingFang TC",sans-serif;background:#0F1418;color:#E8E9EC;
+       display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column;gap:16px}
+  .spin{width:32px;height:32px;border:3px solid #262E36;border-top-color:#6B5FE0;border-radius:50%;animation:s 1s linear infinite}
+  @keyframes s{to{transform:rotate(360deg)}}
+  p{font-size:14px;color:#A8AEB6}
+  .err{color:#E57373;font-size:13px;max-width:300px;text-align:center;line-height:1.6}
+</style>
+</head>
+<body>
+  <div class="spin"></div>
+  <p id="msg">登入處理中，請稍候…</p>
+
+<script>
+(function () {
+  // 從 URL 取出 OAuth 回傳的參數
+  var params = new URLSearchParams(window.location.search);
+  var code = params.get('code');
+  var error = params.get('error');
+  var state = params.get('state');
+
+  function send(payload) {
+    // 把結果傳回開啟此 popup 的主視窗
+    if (window.opener) {
+      window.opener.postMessage(
+        Object.assign({ source: 'credit-pwa-oauth' }, payload),
+        'https://xin-yu-1122.github.io'
+      );
+    }
+  }
+
+  if (error) {
+    document.getElementById('msg').textContent = '';
+    var e = document.createElement('div');
+    e.className = 'err';
+    e.textContent = '登入失敗：' + error + '。請關閉此視窗重試。';
+    document.body.appendChild(e);
+    send({ ok: false, error: error });
+    setTimeout(function () { window.close(); }, 2500);
+    return;
+  }
+
+  if (code) {
+    // 把授權碼傳回主視窗，主視窗會送去 Worker 換 token
+    send({ ok: true, code: code, state: state });
+    document.getElementById('msg').textContent = '登入成功，視窗即將關閉…';
+    setTimeout(function () { window.close(); }, 600);
+    return;
+  }
+
+  // 沒有 code 也沒有 error
+  document.getElementById('msg').textContent = '無效的回應，請關閉此視窗重試。';
+  send({ ok: false, error: 'no_code' });
+  setTimeout(function () { window.close(); }, 2500);
+})();
+</script>
+</body>
+</html>

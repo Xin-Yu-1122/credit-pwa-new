@@ -358,7 +358,7 @@ td.r,th.r{text-align:right}
     <div class="login-icon">💳</div>
     <h1>信用卡記帳</h1>
     <p>多帳戶管理・自動寫入 Google 試算表<br>一鍵記錄消費與分期</p>
-    <button class="btn-google" onclick="signIn()">
+    <button class="btn-google" id="login-btn" onclick="signIn()">
       <span style="font-size:18px">🔑</span>
       使用 Google 帳號登入
     </button>
@@ -538,9 +538,8 @@ td.r,th.r{text-align:right}
 
 <!-- Chart.js -->
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.0/chart.umd.min.js"></script>
-<!-- Google APIs -->
-<script src="https://accounts.google.com/gsi/client" async defer></script>
+<!-- Google APIs (僅需 gapi for Sheets) -->
 <script src="https://apis.google.com/js/api.js" async defer></script>
-<script src="app.js?v=1.8"></script>
+<script src="app.js?v=1.9"></script>
 </body>
 </html>

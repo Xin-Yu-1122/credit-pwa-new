@@ -1,7 +1,7 @@
-// Service Worker - 信用卡記帳 PWA v1.2
+// Service Worker - 信用卡記帳 PWA v1.9
 // 設計原則：install 不預先快取（避免任何資源失敗導致 SW 整個壞掉）
 // HTML：Network First；靜態資源：Cache First；跨域（Google APIs）：完全不攔截
-const CACHE_NAME = 'credit-pwa-v1.2';
+const CACHE_NAME = 'credit-pwa-v1.9';
 
 self.addEventListener('install', e => {
   // 不做任何 cache.addAll，直接 skipWaiting
