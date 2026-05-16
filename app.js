@@ -4,7 +4,7 @@
 
 const CLIENT_ID = '144262693536-poq7p69eo0aqr3r0onjafrd2f1rfrmg3.apps.googleusercontent.com';
 const SCOPES = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file';
-const APP_VERSION = 'v1.9';
+const APP_VERSION = 'v2.0';
 
 // 9 個銀行（用於儀表板顯示與計算）
 // totalCol = 該銀行總計欄(row 56)；paidCol/accBalCol = 在 row 57 該銀行的「已匯入」「帳戶餘額」位置
@@ -103,17 +103,57 @@ let SHEET_ID = '';
 let TOKEN = null;
 let CURRENT_USER = null;
 let CURRENT_MONTH = ''; // 'YY_MM'
-let CURRENT_TAB = 'dashboard';
+let CURRENT_TAB = 'add'; // 預設進記帳 tab
 let MONTH_DATA = {}; // {cardKey: [{rowIdx, date, amount, note, category, installment}]}
 let BANK_DATA = {};  // {bankKey: {total, rebate, install, paid, accBalRaw, accBal, net, pending, isPaidCheck}}
 let EDIT_TARGET = null; // {bankKey(=cardKey), rowIdx} for editing
 let HISTORY_DATA = null; // 6 個月歷史
+
+// 載入狀態追蹤
+let MONTH_LOADED_FOR = ''; // 已載入完成的月份 key（避免重複載）
+let LOADING_MONTH = false; // 正在載入中
+let MONTH_DATA_IS_STALE = false; // 當前 MONTH_DATA 來自快取（背景刷新中）
 
 // 圖表實例（切換主題前先 destroy）
 let pieChartInstance = null;
 let trendChartInstance = null;
 let TREND_CACHE = null;        // 趨勢資料快取（避免切月份重複抓）
 let currentAnalysisTab = 0;    // 0=消費分析, 1=歷史趨勢
+
+// ─── 快取系統 ────────────────────────────────────────────────
+// 統一的 localStorage 快取，支援 TTL（-1 = 永久）
+function cacheGet(key) {
+  try {
+    const raw = localStorage.getItem('cache-' + key);
+    if (!raw) return null;
+    const { ts, ttl, data } = JSON.parse(raw);
+    if (ttl !== -1 && Date.now() - ts > ttl) return null;
+    return data;
+  } catch { return null; }
+}
+function cacheSet(key, data, ttlMs) {
+  try {
+    localStorage.setItem('cache-' + key, JSON.stringify({
+      ts: Date.now(),
+      ttl: ttlMs === Infinity ? -1 : (ttlMs || -1),
+      data,
+    }));
+  } catch (e) { console.warn('快取寫入失敗', e); }
+}
+function cacheRemove(key) {
+  try { localStorage.removeItem('cache-' + key); } catch {}
+}
+
+const CACHE_TTL = {
+  categories: Infinity,        // 分類永久
+  months: 24 * 60 * 60 * 1000, // 月份清單 24h
+  monthData: 7 * 24 * 60 * 60 * 1000, // 月份資料 7 天（SWR：用過期的先顯示，背景再更新）
+};
+
+function todayYYMM() {
+  const d = new Date();
+  return `${String(d.getFullYear()).slice(2)}_${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
 
 // ─── 初始化 ──────────────────────────────────────────────────
 // OAuth 設定（Authorization Code flow + Cloudflare Worker）
@@ -553,17 +593,47 @@ async function resetPWA() {
 }
 
 // ─── 主程式啟動 ─────────────────────────────────────────────
+// 登入後第一時間進入 App：不等任何 API，直接顯示記帳 tab
 async function initApp() {
-  await loadCategories();
-  await detectAvailableMonths();
+  // 1) 預設月份 = 今天
+  CURRENT_MONTH = todayYYMM();
+  CURRENT_TAB = 'add';
+
+  // 2) 從快取讀分類；沒快取就用程式內預設（CATEGORIES 已有預設值）
+  const cachedCats = cacheGet('categories');
+  if (cachedCats && cachedCats.length) CATEGORIES = cachedCats;
+
+  // 3) 月份清單：從快取讀；沒快取就用最近 6 個月當 fallback
+  const cachedMonths = cacheGet('months');
+  window.AVAILABLE_MONTHS = (cachedMonths && cachedMonths.length) ? cachedMonths : defaultMonthsList();
+
+  // 4) 立刻渲染上方月份下拉、記帳 tab
   populateMonthSelector();
-  populateBankSelector();
-  populateCategorySelector();
-  populateColorPicker();
-  await loadCurrentMonth();
+  switchTab('add');
+
+  // 5) 背景刷新（不阻塞）：去抓真實的分類 + 月份清單
+  refreshCategoriesBg();
+  refreshMonthsBg();
+
+  // 6) 背景預抓當月資料（不阻塞），方便切到儀表板時瞬間顯示
+  prefetchCurrentMonth();
 }
 
-async function loadCategories() {
+// 預設月份清單：最近 6 個月（用於還沒拿到試算表清單時的 fallback）
+function defaultMonthsList() {
+  const list = [];
+  const now = new Date();
+  for (let i = 0; i < 6; i++) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    const yy = String(d.getFullYear()).slice(2);
+    const mm = String(d.getMonth() + 1).padStart(2, '0');
+    list.push(`${yy}_${mm}`);
+  }
+  return list;
+}
+
+// 背景刷新分類（不阻塞 UI）
+async function refreshCategoriesBg() {
   try {
     const r = await sheetGet(SHEET_ID, '帳務類型!A2:C100');
     const rows = r.result.values || [];
@@ -573,18 +643,26 @@ async function loadCategories() {
       const name = (row[0] || '').trim();
       if (!name) return;
       const must = !!(row[1] && row[1].trim());
-      const notMust = !!(row[2] && row[2].trim());
-      cats.push({name, essential: must});
+      cats.push({ name, essential: must });
     });
-    if (cats.length) CATEGORIES = cats;
+    if (cats.length) {
+      CATEGORIES = cats;
+      cacheSet('categories', cats, CACHE_TTL.categories);
+      // 若記帳 tab 在前景，更新分類下拉
+      if (CURRENT_TAB === 'add') updateAddCategoryOptions();
+    }
   } catch (e) {
-    console.warn('讀取分類失敗，使用預設值', e);
+    console.warn('刷新分類失敗（用快取/預設）', e);
   }
 }
 
-async function detectAvailableMonths() {
+// 背景刷新月份清單
+async function refreshMonthsBg() {
   try {
-    const r = await gapi.client.sheets.spreadsheets.get({spreadsheetId: SHEET_ID});
+    const r = await retryWithAuth(() => gapi.client.sheets.spreadsheets.get({
+      spreadsheetId: SHEET_ID,
+      fields: 'sheets.properties.title',
+    }));
     const sheets = r.result.sheets || [];
     const months = [];
     sheets.forEach(s => {
@@ -593,27 +671,53 @@ async function detectAvailableMonths() {
     });
     months.sort().reverse();
     window.AVAILABLE_MONTHS = months;
-    // 預設：今天的月份；若沒有則用最新
-    const now = new Date();
-    const yy = String(now.getFullYear()).slice(2);
-    const mm = String(now.getMonth() + 1).padStart(2, '0');
-    const today = `${yy}_${mm}`;
-    CURRENT_MONTH = months.includes(today) ? today : (months[0] || today);
+    cacheSet('months', months, CACHE_TTL.months);
+    // 若上方月份下拉/記帳 tab 在用，更新它
+    populateMonthSelector();
+    if (CURRENT_TAB === 'add') updateAddMonthOptions();
   } catch (e) {
-    console.error('讀取月份分頁失敗', e);
-    notify('無法讀取試算表，請檢查試算表 ID', 'err');
+    console.warn('刷新月份清單失敗（用快取/預設）', e);
   }
 }
 
+// 背景預抓當月資料：寫進快取，使用者切到儀表板時可瞬間顯示
+async function prefetchCurrentMonth() {
+  const monthKey = CURRENT_MONTH;
+  // 已有快取就跳過（除非太舊，但 SWR 流程自己會處理）
+  const cached = cacheGet(`month-${monthKey}`);
+  if (cached) return;
+  try {
+    await fetchAndParseMonth(monthKey);
+  } catch (e) {
+    // 預抓失敗無所謂（使用者切過去時再試）
+    console.warn('預抓當月失敗', e);
+  }
+}
+
+// 取得分類（給記帳表單下拉用）— 一律從 CATEGORIES（已含快取/預設 fallback）
+function getCategoriesForForm() {
+  return CATEGORIES || [];
+}
+
 function populateMonthSelector() {
-  const months = window.AVAILABLE_MONTHS || [];
+  const months = window.AVAILABLE_MONTHS || defaultMonthsList();
   const items = months.map(m => {
     const [yy, mm] = m.split('_');
     return {value: m, label: `20${yy}/${mm}`};
   });
   csInit('cs-month-wrap', items, CURRENT_MONTH, async (newVal) => {
+    if (newVal === CURRENT_MONTH) return;
     CURRENT_MONTH = newVal;
-    await loadCurrentMonth();
+    MONTH_LOADED_FOR = ''; // 強制下次切到儀表板/分析時重抓
+    // 只有目前在儀表板/分析才立刻載入；在記帳 tab 則延後
+    if (CURRENT_TAB === 'dashboard' || CURRENT_TAB === 'analysis') {
+      await loadCurrentMonth();
+    }
+    // 同步更新記帳表單的月份預設（如果在記帳 tab）
+    if (CURRENT_TAB === 'add') {
+      const sel = document.getElementById('f2-month');
+      if (sel) sel.value = newVal;
+    }
   });
 }
 
@@ -733,21 +837,57 @@ function onInstallmentChange() {
   if (checked) selectColor(2); // 自動套橘色
 }
 
+// 載入當月資料：SWR 策略（先用快取顯示，背景刷新）
 async function loadCurrentMonth() {
-  document.getElementById('tab-content').innerHTML = `<div style="text-align:center;padding:40px;color:var(--fg3)"><span class="loader"></span> 載入 ${CURRENT_MONTH}…</div>`;
+  const monthKey = CURRENT_MONTH;
+  // 先看快取
+  const cached = cacheGet(`month-${monthKey}`);
+  if (cached && cached.MONTH_DATA && cached.BANK_DATA) {
+    MONTH_DATA = cached.MONTH_DATA;
+    BANK_DATA = cached.BANK_DATA;
+    MONTH_LOADED_FOR = monthKey;
+    MONTH_DATA_IS_STALE = true;
+    renderTab(); // 立刻渲染快取資料
+    // 背景靜默刷新
+    fetchAndParseMonth(monthKey).then(() => {
+      // 若使用者還在這個月份，重新渲染
+      if (CURRENT_MONTH === monthKey) {
+        MONTH_DATA_IS_STALE = false;
+        if (CURRENT_TAB === 'dashboard' || CURRENT_TAB === 'analysis') renderTab();
+      }
+    }).catch(e => console.warn('背景刷新月份失敗', e));
+    return;
+  }
+
+  // 沒快取 → 顯示 skeleton 載入
+  showSkeleton();
+  try {
+    await fetchAndParseMonth(monthKey);
+    MONTH_LOADED_FOR = monthKey;
+    MONTH_DATA_IS_STALE = false;
+    renderTab();
+  } catch (e) {
+    handleMonthLoadError(e, monthKey);
+  }
+}
+
+// 實際打 API 並 parse 資料 + 寫入快取
+async function fetchAndParseMonth(monthKey) {
+  if (LOADING_MONTH) return; // 避免並發
+  LOADING_MONTH = true;
   try {
     // 用 spreadsheets.get with grid data，一次抓「值」+「背景色」
     const r = await retryWithAuth(() => gapi.client.sheets.spreadsheets.get({
       spreadsheetId: SHEET_ID,
-      ranges: [`${CURRENT_MONTH}!A4:BL57`],
+      ranges: [`${monthKey}!A4:BL57`],
       fields: 'sheets.data.rowData.values(formattedValue,effectiveValue,effectiveFormat.backgroundColor)',
     }));
     const sheetData = r.result.sheets?.[0]?.data?.[0];
     const rowDataArr = sheetData?.rowData || [];
 
     // 解析成 [54 列][64 欄] 的 values 與 backgrounds
-    const rows = []; // 值
-    const bgs = [];  // 背景色 {red,green,blue}
+    const rows = [];
+    const bgs = [];
     for (let i = 0; i < 54; i++) {
       const cells = rowDataArr[i]?.values || [];
       const rv = [], rb = [];
@@ -770,15 +910,63 @@ async function loadCurrentMonth() {
     }
 
     parseMonthData(rows, bgs);
-    renderTab();
-  } catch (e) {
-    console.error('載入月份失敗', e);
-    if (e?.status === 404 || (e?.result?.error?.code === 400)) {
-      document.getElementById('tab-content').innerHTML = `<div class="empty"><div class="empty-icon">📋</div><p>找不到 ${CURRENT_MONTH} 月份分頁<br><br>請先在試算表建立此月份分頁</p></div>`;
+    // 寫入快取
+    if (CURRENT_MONTH === monthKey) {
+      cacheSet(`month-${monthKey}`, {
+        MONTH_DATA,
+        BANK_DATA,
+      }, CACHE_TTL.monthData);
     } else {
-      document.getElementById('tab-content').innerHTML = `<div class="empty"><div class="empty-icon">⚠</div><p>載入失敗<br><span class="dim">${e?.result?.error?.message || e?.message || e}</span></p></div>`;
+      // 預抓的情況：把資料 parse 後直接存進快取，不影響當前 state
+      const tmpMD = JSON.parse(JSON.stringify(MONTH_DATA));
+      const tmpBD = JSON.parse(JSON.stringify(BANK_DATA));
+      cacheSet(`month-${monthKey}`, { MONTH_DATA: tmpMD, BANK_DATA: tmpBD }, CACHE_TTL.monthData);
     }
+  } finally {
+    LOADING_MONTH = false;
   }
+}
+
+function handleMonthLoadError(e, monthKey) {
+  console.error('載入月份失敗', e);
+  const el = document.getElementById('tab-content');
+  if (!el) return;
+  if (e?.status === 404 || (e?.result?.error?.code === 400)) {
+    el.innerHTML = `<div class="empty"><div class="empty-icon">📋</div><p>找不到 ${monthKey} 月份分頁<br><br>請先在試算表建立此月份分頁</p><button class="btn btn-primary" style="margin-top:14px" onclick="openSheet()">前往試算表</button></div>`;
+  } else {
+    el.innerHTML = `<div class="empty"><div class="empty-icon">⚠</div><p>載入失敗<br><span class="dim">${e?.result?.error?.message || e?.message || e}</span></p></div>`;
+  }
+}
+
+// Skeleton 載入畫面（含已等待秒數）
+let _skeletonTimer = null;
+function showSkeleton() {
+  const el = document.getElementById('tab-content');
+  if (!el) return;
+  const startTs = Date.now();
+  el.innerHTML = `
+    <div class="sk-kpi-grid">
+      <div class="skeleton sk-kpi"></div>
+      <div class="skeleton sk-kpi"></div>
+      <div class="skeleton sk-kpi"></div>
+      <div class="skeleton sk-kpi"></div>
+      <div class="skeleton sk-kpi"></div>
+      <div class="skeleton sk-kpi"></div>
+    </div>
+    <div class="skeleton sk-bank"></div>
+    <div class="skeleton sk-bank"></div>
+    <div class="loading-elapsed" id="loading-elapsed">載入中… 0.0s</div>
+  `;
+  if (_skeletonTimer) clearInterval(_skeletonTimer);
+  _skeletonTimer = setInterval(() => {
+    const lbl = document.getElementById('loading-elapsed');
+    if (!lbl) { clearInterval(_skeletonTimer); _skeletonTimer = null; return; }
+    const s = ((Date.now() - startTs) / 1000).toFixed(1);
+    lbl.textContent = `載入中… ${s}s`;
+  }, 100);
+}
+function hideSkeleton() {
+  if (_skeletonTimer) { clearInterval(_skeletonTimer); _skeletonTimer = null; }
 }
 
 // 顏色判斷工具：判斷儲存格背景色
@@ -941,21 +1129,331 @@ async function retryWithAuth(fn) {
 }
 
 // ─── 標籤切換 ────────────────────────────────────────────────
-function switchTab(tab) {
+async function switchTab(tab) {
   CURRENT_TAB = tab;
   document.querySelectorAll('.tab-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
-  renderTab();
+
+  // 記帳 tab → 直接渲染表單（不需要試算表資料）
+  if (tab === 'add') {
+    hideSkeleton();
+    renderAddTab();
+    return;
+  }
+
+  // 儀表板 / 消費分析 → 需要月份資料
+  if (tab === 'dashboard' || tab === 'analysis') {
+    // 已載入過當月 → 直接渲染
+    if (MONTH_LOADED_FOR === CURRENT_MONTH && Object.keys(MONTH_DATA).length) {
+      renderTab();
+      return;
+    }
+    // 否則啟動 SWR 載入流程
+    await loadCurrentMonth();
+  }
 }
 
 function renderTab() {
-  if (CURRENT_TAB === 'dashboard') renderDashboard();
+  hideSkeleton();
+  if (CURRENT_TAB === 'add') renderAddTab();
+  else if (CURRENT_TAB === 'dashboard') renderDashboard();
   else if (CURRENT_TAB === 'analysis') renderAnalysis();
 }
 
-// ─── 計算函式 ────────────────────────────────────────────────
-function getCardTotal(cardKey) {
-  const items = MONTH_DATA[cardKey] || [];
-  return items.reduce((s, it) => s + it.amount, 0);
+// ─── 記帳 Tab（inline 表單）──────────────────────────────────
+// 這個表單獨立於 modal 編輯表單，使用 f2-* 前綴的元素 id
+function renderAddTab() {
+  const el = document.getElementById('tab-content');
+  if (!el) return;
+  const cats = getCategoriesForForm();
+  const months = window.AVAILABLE_MONTHS || defaultMonthsList();
+  const today = new Date();
+  const todayStr = `${today.getFullYear()}-${String(today.getMonth()+1).padStart(2,'0')}-${String(today.getDate()).padStart(2,'0')}`;
+  const monthDefault = todayYYMM();
+
+  el.innerHTML = `
+    <div class="card" style="padding:18px 16px;margin-bottom:12px">
+      <div style="font-size:15px;font-weight:600;color:var(--fg1);margin-bottom:14px">✏️ 新增記帳</div>
+
+      <div class="field">
+        <label>月份分頁</label>
+        <select class="inp" id="f2-month"></select>
+      </div>
+
+      <div class="field">
+        <label>記帳項目（銀行）</label>
+        <select class="inp" id="f2-bankgroup" onchange="onBankGroupChange2()">
+          <option value="">— 請選擇 —</option>
+          ${BANKS.map(b => `<option value="${b.key}">${b.name}</option>`).join('')}
+        </select>
+      </div>
+
+      <div class="field hidden" id="f2-card-field">
+        <label>卡別</label>
+        <select class="inp" id="f2-card"></select>
+      </div>
+
+      <div class="field">
+        <label>日期</label>
+        <input class="inp" id="f2-date" type="date" value="${todayStr}"/>
+      </div>
+
+      <div class="field">
+        <label>金額（負數=刷退）</label>
+        <input class="inp" id="f2-amt" type="number" step="1" placeholder="例：350 或 -100" inputmode="numeric"/>
+      </div>
+
+      <div class="field">
+        <label>備註 / 帳務資訊</label>
+        <textarea class="inp" id="f2-note" placeholder="例：全家便利商店、午餐"></textarea>
+      </div>
+
+      <div class="field">
+        <label>分類</label>
+        <select class="inp" id="f2-cat">
+          ${cats.map(c => `<option value="${escapeHtml(c.name)}">${escapeHtml(c.name)}</option>`).join('')}
+        </select>
+      </div>
+
+      <div class="field">
+        <label>底色</label>
+        <div class="color-grid" id="f2-colors"></div>
+      </div>
+
+      <div class="field">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+          <input type="checkbox" id="f2-installment" onchange="onInstallmentChange2()" style="accent-color:var(--orange)"/>
+          <span>分期付款（自動加 [分期] + 橘色底）</span>
+        </label>
+      </div>
+
+      <div class="btn-row" style="margin-top:18px">
+        <button class="btn btn-ghost" onclick="resetAddForm()">清除</button>
+        <button class="btn btn-primary" id="f2-save" onclick="saveAddEntry()">儲存</button>
+      </div>
+    </div>
+  `;
+
+  // 填入月份下拉、預設今天
+  updateAddMonthOptions();
+  document.getElementById('f2-month').value = monthDefault;
+
+  // 渲染色卡
+  renderAddColorPicker();
+  selectColor2(0);
+}
+
+function updateAddMonthOptions() {
+  const sel = document.getElementById('f2-month');
+  if (!sel) return;
+  const months = window.AVAILABLE_MONTHS || defaultMonthsList();
+  const current = sel.value || todayYYMM();
+  sel.innerHTML = months.map(m => {
+    const [yy, mm] = m.split('_');
+    return `<option value="${m}">20${yy}/${mm}</option>`;
+  }).join('');
+  // 確保預設值在清單裡（不在就硬加進去）
+  if (current && !months.includes(current)) {
+    const [yy, mm] = current.split('_');
+    sel.innerHTML = `<option value="${current}">20${yy}/${mm}（待建立）</option>` + sel.innerHTML;
+  }
+  sel.value = current;
+}
+
+function updateAddCategoryOptions() {
+  const sel = document.getElementById('f2-cat');
+  if (!sel) return;
+  const current = sel.value;
+  const cats = getCategoriesForForm();
+  sel.innerHTML = cats.map(c => `<option value="${escapeHtml(c.name)}">${escapeHtml(c.name)}</option>`).join('');
+  if (current) sel.value = current;
+}
+
+function renderAddColorPicker() {
+  const wrap = document.getElementById('f2-colors');
+  if (!wrap) return;
+  wrap.innerHTML = COLORS.map(c => {
+    const bg = c.hex || 'transparent';
+    const border = c.hex ? c.hex : 'var(--bg4)';
+    const inner = c.hex ? '' : `<span style="font-size:10px;color:var(--fg3)">無</span>`;
+    return `<div class="color-opt" data-color="${c.id}" onclick="selectColor2(${c.id})" style="background:${bg};border-color:${border};display:flex;align-items:center;justify-content:center" title="${c.name}">${inner}</div>`;
+  }).join('');
+}
+
+let SELECTED_COLOR_2 = 0;
+function selectColor2(id) {
+  SELECTED_COLOR_2 = id;
+  document.querySelectorAll('#f2-colors .color-opt').forEach(el => {
+    el.classList.toggle('selected', parseInt(el.dataset.color) === id);
+  });
+}
+
+function onBankGroupChange2() {
+  const bankKey = document.getElementById('f2-bankgroup').value;
+  const cardField = document.getElementById('f2-card-field');
+  const cardSel = document.getElementById('f2-card');
+  if (!bankKey) {
+    cardField.classList.add('hidden');
+    cardSel.innerHTML = '';
+    return;
+  }
+  const cards = BANKS_CARDS.filter(c => c.bankKey === bankKey);
+  if (cards.length <= 1) {
+    cardField.classList.add('hidden');
+    cardSel.innerHTML = `<option value="${cards[0]?.key || ''}">${cards[0]?.name || ''}</option>`;
+    cardSel.value = cards[0]?.key || '';
+  } else {
+    cardField.classList.remove('hidden');
+    cardSel.innerHTML = cards.map(c =>
+      `<option value="${c.key}">${c.name}${c.tag?` (${c.tag})`:''}</option>`
+    ).join('');
+    const def = BANK_DEFAULT_CARD[bankKey] || cards[0]?.key;
+    cardSel.value = def;
+  }
+}
+
+function onInstallmentChange2() {
+  const chk = document.getElementById('f2-installment').checked;
+  if (chk) selectColor2(2); // 橘色
+  else selectColor2(0);
+}
+
+function resetAddForm() {
+  // 清空欄位、回到預設
+  renderAddTab();
+}
+
+// 月份分頁不存在 modal
+function openSheetNE(monthKey) {
+  document.getElementById('sne-month-label').textContent = monthKey;
+  document.getElementById('sheet-ne-modal').classList.remove('hidden');
+}
+function closeSheetNE() {
+  document.getElementById('sheet-ne-modal').classList.add('hidden');
+}
+
+// 檢查目標月份是否存在試算表中（用快取的 AVAILABLE_MONTHS 做快速檢查；如果沒在快取就實際打 API 確認）
+async function ensureMonthSheetExists(monthKey) {
+  const months = window.AVAILABLE_MONTHS || [];
+  if (months.includes(monthKey)) return true;
+  // 快取沒有 → 再去抓最新清單確認
+  try {
+    const r = await retryWithAuth(() => gapi.client.sheets.spreadsheets.get({
+      spreadsheetId: SHEET_ID,
+      fields: 'sheets.properties.title',
+    }));
+    const sheets = r.result.sheets || [];
+    const real = [];
+    sheets.forEach(s => {
+      const t = s.properties.title;
+      if (/^\d{2}_\d{2}$/.test(t)) real.push(t);
+    });
+    real.sort().reverse();
+    window.AVAILABLE_MONTHS = real;
+    cacheSet('months', real, CACHE_TTL.months);
+    return real.includes(monthKey);
+  } catch (e) {
+    console.warn('檢查月份分頁失敗', e);
+    return false;
+  }
+}
+
+// 從 inline 表單存記帳
+async function saveAddEntry() {
+  const bankKey = document.getElementById('f2-card').value;
+  if (!bankKey) return notify('請選擇記帳項目', 'err');
+  const targetMonth = document.getElementById('f2-month').value || todayYYMM();
+  const dateRaw = document.getElementById('f2-date').value;
+  if (!dateRaw) return notify('請選擇日期', 'err');
+  const amt = document.getElementById('f2-amt').value;
+  if (!amt) return notify('請輸入金額', 'err');
+  let note = document.getElementById('f2-note').value.trim();
+  const category = document.getElementById('f2-cat').value;
+  const installment = document.getElementById('f2-installment').checked;
+
+  const btn = document.getElementById('f2-save');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="loader"></span> 儲存中…';
+
+  try {
+    // 1) 先確認月份分頁存在
+    const exists = await ensureMonthSheetExists(targetMonth);
+    if (!exists) {
+      openSheetNE(targetMonth);
+      return;
+    }
+
+    // 2) 找空 row → 需要當月資料；若快取沒有則先抓
+    let rowIdx = null;
+    const cached = cacheGet(`month-${targetMonth}`);
+    if (cached && cached.MONTH_DATA && cached.MONTH_DATA[bankKey]) {
+      const usedRows = new Set(cached.MONTH_DATA[bankKey].map(it => it.rowIdx));
+      for (let r = 4; r <= 53; r++) if (!usedRows.has(r)) { rowIdx = r; break; }
+    }
+    if (!rowIdx) {
+      // 沒有快取 → 直接打 API 抓目標月份該卡的欄位看是否有空
+      rowIdx = await findEmptyRowRemote(targetMonth, bankKey);
+    }
+    if (!rowIdx) return notify('該卡 50 筆已滿，請刪除舊記錄', 'err');
+
+    // 3) 組備註的分期標記
+    if (installment && !/\[分期\]/.test(note)) note = note ? `${note} [分期]` : '[分期]';
+    if (!installment) note = note.replace(/\s*\[分期\]\s*/g, '').trim();
+
+    // 4) 寫入
+    const bank = BANKS_CARDS.find(b => b.key === bankKey);
+    const startCol = bank.col;
+    const date = dateToMD(dateRaw);
+    const range = `${targetMonth}!${startCol}${rowIdx}:${idxToCol(colToIdx(startCol)+3)}${rowIdx}`;
+    await sheetUpdate(SHEET_ID, range, [[date, parseFloat(amt), note, category]]);
+
+    // 5) 套底色（分期 → 橘；否則照選色）
+    await applyRowColor(bankKey, rowIdx, installment ? 2 : SELECTED_COLOR_2, targetMonth);
+
+    // 6) 共同飲食同步
+    if (category === '共同飲食') {
+      await syncCommonFood(rowIdx, date, parseFloat(amt), note, targetMonth);
+    }
+
+    notify('✓ 已儲存', 'ok');
+
+    // 7) 清除該月份快取（因為資料變了）、若使用者切到儀表板/分析會重新抓
+    cacheRemove(`month-${targetMonth}`);
+    if (targetMonth === CURRENT_MONTH) {
+      MONTH_LOADED_FOR = ''; // 強制下次切過去時重抓
+    }
+
+    // 8) 重置表單（保留月份、銀行/卡別）讓快速連續記帳
+    document.getElementById('f2-amt').value = '';
+    document.getElementById('f2-note').value = '';
+    document.getElementById('f2-installment').checked = false;
+    selectColor2(0);
+    document.getElementById('f2-amt').focus();
+  } catch (e) {
+    console.error(e);
+    notify('儲存失敗：' + (e?.result?.error?.message || e?.message || '未知錯誤'), 'err');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '儲存';
+  }
+}
+
+// 直接打 API 找指定月份+卡的空 row（沒快取時用）
+async function findEmptyRowRemote(monthKey, bankKey) {
+  const bank = BANKS_CARDS.find(b => b.key === bankKey);
+  if (!bank) return null;
+  const range = `${monthKey}!${bank.col}4:${bank.col}53`;
+  try {
+    const r = await sheetGet(SHEET_ID, range);
+    const vals = r.result.values || [];
+    for (let i = 0; i < 50; i++) {
+      const v = vals[i]?.[0];
+      if (v === '' || v == null) return i + 4;
+    }
+    return null;
+  } catch (e) {
+    // 月份分頁不存在會走到這（前面 ensureMonthSheetExists 應該已經擋掉）
+    return 4; // fallback
+  }
 }
 
 // ─── 儀表板 ──────────────────────────────────────────────────
@@ -1119,11 +1617,27 @@ function mdToDate(md, refMonth) {
 
 function populateFormMonthSelector(disabled) {
   const sel = document.getElementById('f-month');
-  sel.innerHTML = (window.AVAILABLE_MONTHS || []).map(m => {
+  sel.innerHTML = (window.AVAILABLE_MONTHS || defaultMonthsList()).map(m => {
     const [yy, mm] = m.split('_');
     return `<option value="${m}">20${yy}/${mm}</option>`;
   }).join('');
   sel.disabled = !!disabled;
+}
+
+// Modal 表單共用：填入銀行/分類/底色（懶載入，editEntry 之前呼叫）
+function ensureModalFormReady() {
+  const bankSel = document.getElementById('f-bankgroup');
+  if (bankSel && bankSel.options.length <= 1) {
+    populateBankSelector();
+  }
+  const catSel = document.getElementById('f-cat');
+  if (catSel && !catSel.options.length) {
+    populateCategorySelector();
+  }
+  const colorWrap = document.getElementById('f-colors');
+  if (colorWrap && !colorWrap.children.length) {
+    populateColorPicker();
+  }
 }
 
 function openAddForm() {
@@ -1153,6 +1667,7 @@ function editEntry(cardKey, rowIdx) {
   if (!it) return;
   const card = BANKS_CARDS.find(c => c.key === cardKey);
   if (!card) return;
+  ensureModalFormReady();
   EDIT_TARGET = {bankKey: cardKey, rowIdx};
   populateFormMonthSelector(true);
   document.getElementById('form-title').textContent = '編輯記錄';
@@ -1211,6 +1726,10 @@ async function saveEntry() {
     }
     notify('✓ 已儲存', 'ok');
     closeForm();
+    // 清除快取（資料變了）
+    cacheRemove(`month-${targetMonth}`);
+    if (targetMonth !== CURRENT_MONTH) cacheRemove(`month-${CURRENT_MONTH}`);
+    MONTH_LOADED_FOR = '';
     // 若寫入的月份就是當前顯示的月份，重新載入；否則切換過去
     if (targetMonth === CURRENT_MONTH) {
       await loadCurrentMonth();
@@ -1282,6 +1801,8 @@ async function deleteEntry() {
     await applyRowColor(bankKey, rowIdx, 0);
     notify('已刪除', 'ok');
     closeForm();
+    cacheRemove(`month-${CURRENT_MONTH}`);
+    MONTH_LOADED_FOR = '';
     await loadCurrentMonth();
   } catch (e) {
     notify('刪除失敗', 'err');
@@ -1729,11 +2250,22 @@ async function reloadAll() {
   TREND_CACHE = null;
   if (pieChartInstance) { pieChartInstance.destroy(); pieChartInstance = null; }
   if (trendChartInstance) { trendChartInstance.destroy(); trendChartInstance = null; }
-  await loadCategories();
-  await detectAvailableMonths();
+  // 清除月份資料快取（強制重抓）
+  if (CURRENT_MONTH) cacheRemove(`month-${CURRENT_MONTH}`);
+  MONTH_LOADED_FOR = '';
+  // 刷新分類與月份清單
+  await refreshCategoriesBg();
+  await refreshMonthsBg();
   populateMonthSelector();
-  populateCategorySelector();
-  await loadCurrentMonth();
+  // 若在記帳 tab，更新表單下拉
+  if (CURRENT_TAB === 'add') {
+    updateAddCategoryOptions();
+    updateAddMonthOptions();
+  }
+  // 若在儀表板/分析，重新載入當月資料
+  if (CURRENT_TAB === 'dashboard' || CURRENT_TAB === 'analysis') {
+    await loadCurrentMonth();
+  }
   notify('✓ 已重新載入', 'ok');
 }
 
