@@ -4,7 +4,7 @@
 
 const CLIENT_ID = '144262693536-poq7p69eo0aqr3r0onjafrd2f1rfrmg3.apps.googleusercontent.com';
 const SCOPES = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file';
-const APP_VERSION = 'v2.0';
+const APP_VERSION = 'v3.1';
 
 // 9 個銀行（用於儀表板顯示與計算）
 // totalCol = 該銀行總計欄(row 56)；paidCol/accBalCol = 在 row 57 該銀行的「已匯入」「帳戶餘額」位置
@@ -778,7 +778,7 @@ function populateBankSelector() {
   // 銀行群組（9 個）
   const sel = document.getElementById('f-bankgroup');
   sel.innerHTML = '<option value="">— 請選擇 —</option>' +
-    BANKS.map(b => `<option value="${b.key}">${b.name}</option>`).join('');
+    getBanks().map(b => `<option value="${b.key}">${b.name}</option>`).join('');
 }
 
 // 切換銀行 → 自動帶卡別下拉（單卡銀行直接隱藏）
@@ -791,7 +791,7 @@ function onBankGroupChange() {
     cardSel.innerHTML = '';
     return;
   }
-  const cards = BANKS_CARDS.filter(c => c.bankKey === bankKey);
+  const cards = getCards().filter(c => c.bankKey === bankKey);
   if (cards.length <= 1) {
     // 單卡銀行：隱藏卡別下拉，內部維持唯一一張
     cardField.classList.add('hidden');
@@ -845,6 +845,8 @@ async function loadCurrentMonth() {
   if (cached && cached.MONTH_DATA && cached.BANK_DATA) {
     MONTH_DATA = cached.MONTH_DATA;
     BANK_DATA = cached.BANK_DATA;
+    LAST_STRUCT = cached._struct || null;
+    if (LAST_STRUCT) syncDynamicToGlobals(LAST_STRUCT);
     MONTH_LOADED_FOR = monthKey;
     MONTH_DATA_IS_STALE = true;
     renderTab(); // 立刻渲染快取資料
@@ -876,19 +878,19 @@ async function fetchAndParseMonth(monthKey) {
   if (LOADING_MONTH) return; // 避免並發
   LOADING_MONTH = true;
   try {
-    // 用 spreadsheets.get with grid data，一次抓「值」+「背景色」
+    // 抓 A1:BL58：含標題列(1-3)、資料(4-53)、折抵(54)、小計(55)、總計(56)、餘額(57)、已匯入(58)
     const r = await retryWithAuth(() => gapi.client.sheets.spreadsheets.get({
       spreadsheetId: SHEET_ID,
-      ranges: [`${monthKey}!A4:BL57`],
+      ranges: [`${monthKey}!A1:BL58`],
       fields: 'sheets.data.rowData.values(formattedValue,effectiveValue,effectiveFormat.backgroundColor)',
     }));
     const sheetData = r.result.sheets?.[0]?.data?.[0];
     const rowDataArr = sheetData?.rowData || [];
 
-    // 解析成 [54 列][64 欄] 的 values 與 backgrounds
-    const rows = [];
-    const bgs = [];
-    for (let i = 0; i < 54; i++) {
+    // 解析成 [58 列][64 欄] 的 values 與 backgrounds（rowsFull[0] = 第 1 行）
+    const rowsFull = [];
+    const bgsFull = [];
+    for (let i = 0; i < 58; i++) {
       const cells = rowDataArr[i]?.values || [];
       const rv = [], rb = [];
       for (let j = 0; j < 64; j++) {
@@ -905,22 +907,29 @@ async function fetchAndParseMonth(monthKey) {
         rv.push(v);
         rb.push(cell.effectiveFormat?.backgroundColor || null);
       }
-      rows.push(rv);
-      bgs.push(rb);
+      rowsFull.push(rv);
+      bgsFull.push(rb);
     }
 
-    parseMonthData(rows, bgs);
+    // rows/bgs：從第 4 行起
+    const rows = rowsFull.slice(3);
+    const bgs = bgsFull.slice(3);
+
+    // ── v3.1 動態解析（一律新格式，不再做新舊偵測）──
+    const detected = detectStructure(rowsFull);
+    LAST_STRUCT = detected;
+    parseMonthDataDynamic(rowsFull, bgsFull, detected);
+
     // 寫入快取
     if (CURRENT_MONTH === monthKey) {
       cacheSet(`month-${monthKey}`, {
-        MONTH_DATA,
-        BANK_DATA,
+        MONTH_DATA, BANK_DATA, _struct: detected,
       }, CACHE_TTL.monthData);
     } else {
-      // 預抓的情況：把資料 parse 後直接存進快取，不影響當前 state
+      // 預抓的情況
       const tmpMD = JSON.parse(JSON.stringify(MONTH_DATA));
       const tmpBD = JSON.parse(JSON.stringify(BANK_DATA));
-      cacheSet(`month-${monthKey}`, { MONTH_DATA: tmpMD, BANK_DATA: tmpBD }, CACHE_TTL.monthData);
+      cacheSet(`month-${monthKey}`, { MONTH_DATA: tmpMD, BANK_DATA: tmpBD, _struct: detected }, CACHE_TTL.monthData);
     }
   } finally {
     LOADING_MONTH = false;
@@ -980,93 +989,205 @@ function colorClose(bg, r, g, b, tol) {
 function isOrange(bg) { return colorClose(bg, 1, 0.6, 0); }       // #ff9900
 function isPaidGray(bg) { return colorClose(bg, 0.7176, 0.7176, 0.7176); } // #b7b7b7
 
-function parseMonthData(rows, bgs) {
-  MONTH_DATA = {};
-  BANK_DATA = {};
-  bgs = bgs || [];
-  // rows[0] = row 4（第一筆資料）
-  // rows[49] = row 53（最後一筆資料）
-  // rows[50] = row 54（折抵）
-  // rows[51] = row 55（空白行）
-  // rows[52] = row 56（總計／已繳費勾選格 — 灰底=已繳費）
-  // rows[53] = row 57（已匯入 + 帳戶餘額）
+// ═══════════════════════════════════════════════════════════
+// v3.0 動態結構引擎
+// ═══════════════════════════════════════════════════════════
+// 狀態
+let LAST_STRUCT = null;       // 最近一次偵測到的結構
 
-  // 1) 先以「卡」為單位讀條目，存入 MONTH_DATA[cardKey]
-  BANKS_CARDS.forEach(card => {
-    const cIdx = colToIdx(card.col);
-    const aIdx = cIdx + 1, nIdx = cIdx + 2, ccIdx = cIdx + 3;
-    const items = [];
-    for (let i = 0; i < 50; i++) {
-      const r = rows[i] || [];
-      const date = r[cIdx] === '' || r[cIdx] == null ? '' : r[cIdx];
-      const amountRaw = r[aIdx];
-      const note = r[nIdx] || '';
-      const category = r[ccIdx] || '';
-      const amt = parseAmount(amountRaw);
-      if ((amt === null || amt === 0) && !date && !note) continue;
-      // 分期判斷：[分期] 標記 OR 金額儲存格背景色 #ff9900
-      const cellBg = (bgs[i] || [])[aIdx];
-      const isInstByNote = /\[分期\]/.test(String(note));
-      const isInstByBg = isOrange(cellBg);
-      items.push({
-        rowIdx: i + 4,
-        date,
-        amount: amt || 0,
-        note,
-        category,
-        installment: isInstByNote || isInstByBg,
+// 已知銀行名稱關鍵字 → bankKey（用於從第 1 行辨識銀行）
+const BANK_NAME_KEYS = [
+  { key:'cash', match:['現金'] },
+  { key:'fb',   match:['富邦'] },
+  { key:'es',   match:['玉山'] },
+  { key:'ub',   match:['聯邦'] },
+  { key:'cu',   match:['國泰'] },
+  { key:'tx',   match:['台新'] },
+  { key:'sf',   match:['永豐'] },
+  { key:'cb',   match:['彰銀','彰化'] },
+  { key:'cc',   match:['中信','中國信託'] },
+];
+
+function bankKeyFromName(text) {
+  const t = String(text || '');
+  for (const b of BANK_NAME_KEYS) {
+    if (b.match.some(m => t.includes(m))) return b.key;
+  }
+  return null;
+}
+
+// 從第 1、2 行動態偵測銀行區塊與卡片
+// rowsFull[0]=第1行, [1]=第2行, [56]=第57行, [57]=第58行
+function detectStructure(rowsFull) {
+  const row1 = rowsFull[0] || [];
+  const row2 = rowsFull[1] || [];
+
+  // 1) 找所有銀行起始欄（第 1 行有銀行名的欄）
+  const bankCols = []; // [{key,name,colIdx}]
+  for (let j = 0; j < 64; j++) {
+    const v = row1[j];
+    if (v === '' || v == null) continue;
+    const bk = bankKeyFromName(v);
+    if (bk) bankCols.push({ key: bk, name: String(v), colIdx: j });
+  }
+  bankCols.sort((a, b) => a.colIdx - b.colIdx);
+
+  // 2) 找所有卡片（第 2 行有卡名的欄）
+  const cardCols = []; // [{name,colIdx}]
+  for (let j = 0; j < 64; j++) {
+    const v = row2[j];
+    if (v === '' || v == null) continue;
+    cardCols.push({ name: String(v).split('\n')[0].trim(), colIdx: j, rawName: String(v) });
+  }
+  cardCols.sort((a, b) => a.colIdx - b.colIdx);
+
+  // 3) 每個銀行的範圍 = [本銀行起欄, 下一個銀行起欄)
+  const banks = []; // [{key,name,colIdx,endColIdx,cards:[...]}]
+  for (let i = 0; i < bankCols.length; i++) {
+    const b = bankCols[i];
+    const endColIdx = (i + 1 < bankCols.length) ? bankCols[i + 1].colIdx : 64;
+    banks.push({ ...b, endColIdx, cards: [] });
+  }
+
+  // 4) 把卡片分配到所屬銀行（現金特殊：不從第2行找卡，直接用 A 欄）
+  for (const card of cardCols) {
+    const owner = banks.find(b => card.colIdx >= b.colIdx && card.colIdx < b.endColIdx && b.key !== 'cash');
+    if (owner) {
+      owner.cards.push({
+        name: card.name,
+        rawName: card.rawName,
+        colIdx: card.colIdx,
+        // 產生穩定 key：bankKey + 末四碼（若卡名含 (xxxx)）或序號
+        key: makeCardKey(owner.key, card.rawName, owner.cards.length),
       });
     }
-    MONTH_DATA[card.key] = items;
-  });
+  }
 
-  // 2) 以「銀行」為單位計算彙總
-  BANKS.forEach(bank => {
-    const bankCards = BANKS_CARDS.filter(c => c.bankKey === bank.key);
+  // 5) 現金：固定 A 欄（colIdx 0）
+  const cashBank = banks.find(b => b.key === 'cash');
+  if (cashBank) {
+    cashBank.cards.push({ name: '現金', rawName: '現金', colIdx: 0, key: 'cash', isCash: true });
+  }
+
+  return { banks, bankCount: banks.length };
+}
+
+// 產生穩定卡片 key
+function makeCardKey(bankKey, rawName, seq) {
+  const m = String(rawName).match(/\((\d{3,4})\)/); // 抓 (2606) 之類末碼
+  if (m) return `${bankKey}_${m[1]}`;
+  return `${bankKey}_c${seq}`;
+}
+
+// 動態解析（v3.1）
+const REBATE_CATEGORY = '抵扣回饋'; // 特殊分類：抵扣回饋（記負數，獨立統計）
+function parseMonthDataDynamic(rowsFull, bgsFull, struct) {
+  MONTH_DATA = {};
+  BANK_DATA = {};
+  // 資料列 row4~row54 → rowsFull[3]~rowsFull[53]（51 筆，row54 不再是折抵）
+  // row55小計=rowsFull[54], row56總計=rowsFull[55]
+  // row57餘額=rowsFull[56], row58已匯入=rowsFull[57]
+
+  struct.banks.forEach(bank => {
     let total = 0, rebate = 0, install = 0;
 
-    bankCards.forEach(card => {
-      const cIdx = colToIdx(card.col);
-      const aIdx = cIdx + 1;
-      // 加總所有條目（含負數刷退）
-      for (let i = 0; i < 50; i++) {
-        const r = rows[i] || [];
-        const n = parseAmount(r[aIdx]);
-        if (n === null || n === 0) continue;
-        total += n;
-        // 分期：[分期] 標記 OR 背景色 #ff9900；只算正數
-        const note = String(r[cIdx + 2] || '');
-        const cellBg = (bgs[i] || [])[aIdx];
-        if (n > 0 && (/\[分期\]/.test(note) || isOrange(cellBg))) {
-          install += n;
+    bank.cards.forEach(card => {
+      const cIdx = card.colIdx;
+      const aIdx = cIdx + 1, nIdx = cIdx + 2, ccIdx = cIdx + 3;
+      const items = [];
+      for (let i = 0; i < 51; i++) { // row4~54 = 51 列
+        const r = rowsFull[3 + i] || [];
+        const date = (r[cIdx] === '' || r[cIdx] == null) ? '' : r[cIdx];
+        const amountRaw = r[aIdx];
+        const note = r[nIdx] || '';
+        const category = r[ccIdx] || '';
+        const amt = parseAmount(amountRaw);
+        if ((amt === null || amt === 0) && !date && !note) continue;
+        const cellBg = (bgsFull[3 + i] || [])[aIdx];
+        const isInst = /\[分期\]/.test(String(note)) || isOrange(cellBg);
+        const isRebate = String(category).trim() === REBATE_CATEGORY;
+        items.push({
+          rowIdx: i + 4, date, amount: amt || 0, note, category,
+          installment: isInst, isRebate,
+        });
+        if (amt && amt !== 0) {
+          total += amt; // 抵扣回饋已記負數，自然被算進 total（呼應你試算表小計公式）
+          if (isRebate) {
+            rebate += amt; // 累計抵扣回饋（負數，直接加）
+          } else if (amt > 0 && isInst) {
+            install += amt;
+          }
         }
       }
-      // Row 54 = 折抵
-      const rb = parseAmount((rows[50] || [])[aIdx]);
-      rebate += (rb || 0);
+      MONTH_DATA[card.key] = items;
     });
 
-    // 銀行的 paid 與 accBal 都在 row 57 的「銀行專屬欄位」
-    const paidIdx = colToIdx(bank.paidCol);
-    const accBalIdx = colToIdx(bank.accBalCol);
-    const r57 = rows[53] || [];
-    const paid = parseAmount(r57[paidIdx]) || 0;
-    const accBalRaw = parseAmount(r57[accBalIdx]) || 0;
+    // 銀行繳費欄位：
+    //   餘額  = 銀行起欄, row57 (rowsFull[56])
+    //   已匯入 = 銀行起欄, row58 (rowsFull[57])
+    //   現金特殊：A56 總計, A57 餘額
+    let paid = 0, accBalRaw = 0, isPaidCheck = false;
+    if (bank.key === 'cash') {
+      const cashTotal = parseAmount((rowsFull[55] || [])[0]); // A56
+      accBalRaw = parseAmount((rowsFull[56] || [])[0]) || 0;   // A57
+      if (cashTotal != null) total = cashTotal;
+      paid = 0;
+    } else {
+      accBalRaw = parseAmount((rowsFull[56] || [])[bank.colIdx]) || 0; // row57
+      paid = parseAmount((rowsFull[57] || [])[bank.colIdx]) || 0;      // row58
+      const r56bg = (bgsFull[55] || [])[bank.colIdx];
+      isPaidCheck = isPaidGray(r56bg);
+    }
     const accBal = accBalRaw < 0 ? Math.abs(accBalRaw) : 0;
-    const net = total - rebate;
-    const pending = Math.max(0, net - paid);
-
-    // 已繳費判斷：totalCol+'56' 的背景色為 #b7b7b7
-    const totalIdx = colToIdx(bank.totalCol);
-    const r56bg = (bgs[52] || [])[totalIdx];
-    const isPaidCheck = isPaidGray(r56bg);
+    // total 已含負的抵扣回饋（你會自行調整試算表小計公式），net 不再額外扣 rebate
+    const net = total;
+    const pending = bank.key === 'cash' ? 0 : Math.max(0, net - paid);
 
     BANK_DATA[bank.key] = {
       total, rebate, install, paid, accBalRaw, accBal,
-      net, pending, isPaidCheck
+      net, pending, isPaidCheck,
+      _name: bank.name, _cards: bank.cards.map(c => ({ key: c.key, name: c.name })),
     };
   });
+
+  syncDynamicToGlobals(struct);
 }
+
+// 把動態偵測的銀行/卡片同步到全域 BANKS / BANKS_CARDS（記帳表單、儀表板共用）
+function syncDynamicToGlobals(struct) {
+  const newBanks = [];
+  const newCards = [];
+  struct.banks.forEach(b => {
+    newBanks.push({
+      key: b.key,
+      name: b.name.split('(')[0].split('（')[0].trim(),
+      isCash: b.key === 'cash',
+      _colIdx: b.colIdx,
+    });
+    b.cards.forEach(c => {
+      newCards.push({
+        key: c.key,
+        col: idxToCol(c.colIdx),
+        bankKey: b.key,
+        bank: b.name.split('(')[0].split('（')[0].trim(),
+        name: c.name,
+        tag: (c.key.match(/_(\d{3,4})$/) || [])[1] || '',
+        isCash: c.isCash || false,
+      });
+    });
+  });
+  DYNAMIC_BANKS = newBanks;
+  DYNAMIC_CARDS = newCards;
+}
+
+let DYNAMIC_BANKS = null;
+let DYNAMIC_CARDS = null;
+
+
+// 取得目前要用的 BANKS / BANKS_CARDS（動態優先，否則寫死）
+function getBanks() { return DYNAMIC_BANKS || BANKS; }
+function getCards() { return DYNAMIC_CARDS || BANKS_CARDS; }
+
 
 function colToIdx(col) {
   let n = 0;
@@ -1183,7 +1304,7 @@ function renderAddTab() {
         <label>記帳項目（銀行）</label>
         <select class="inp" id="f2-bankgroup" onchange="onBankGroupChange2()">
           <option value="">— 請選擇 —</option>
-          ${BANKS.map(b => `<option value="${b.key}">${b.name}</option>`).join('')}
+          ${getBanks().map(b => `<option value="${b.key}">${b.name}</option>`).join('')}
         </select>
       </div>
 
@@ -1208,8 +1329,9 @@ function renderAddTab() {
       </div>
 
       <div class="field">
-        <label>分類</label>
+        <label>分類 <span style="color:var(--red)">*</span></label>
         <select class="inp" id="f2-cat">
+          <option value="">— 請選擇分類 —</option>
           ${cats.map(c => `<option value="${escapeHtml(c.name)}">${escapeHtml(c.name)}</option>`).join('')}
         </select>
       </div>
@@ -1226,10 +1348,8 @@ function renderAddTab() {
         </label>
       </div>
 
-      <div class="btn-row" style="margin-top:18px">
-        <button class="btn btn-ghost" onclick="resetAddForm()">清除</button>
-        <button class="btn btn-primary" id="f2-save" onclick="saveAddEntry()">儲存</button>
-      </div>
+      <button class="btn btn-primary" id="f2-save" onclick="saveAddEntry()" style="width:100%;margin-top:18px;padding:15px;font-size:16px;font-weight:700">儲存</button>
+      <button class="btn btn-ghost" onclick="resetAddForm()" style="width:100%;margin-top:10px">清除</button>
     </div>
   `;
 
@@ -1264,7 +1384,8 @@ function updateAddCategoryOptions() {
   if (!sel) return;
   const current = sel.value;
   const cats = getCategoriesForForm();
-  sel.innerHTML = cats.map(c => `<option value="${escapeHtml(c.name)}">${escapeHtml(c.name)}</option>`).join('');
+  sel.innerHTML = '<option value="">— 請選擇分類 —</option>' +
+    cats.map(c => `<option value="${escapeHtml(c.name)}">${escapeHtml(c.name)}</option>`).join('');
   if (current) sel.value = current;
 }
 
@@ -1296,7 +1417,7 @@ function onBankGroupChange2() {
     cardSel.innerHTML = '';
     return;
   }
-  const cards = BANKS_CARDS.filter(c => c.bankKey === bankKey);
+  const cards = getCards().filter(c => c.bankKey === bankKey);
   if (cards.length <= 1) {
     cardField.classList.add('hidden');
     cardSel.innerHTML = `<option value="${cards[0]?.key || ''}">${cards[0]?.name || ''}</option>`;
@@ -1368,6 +1489,7 @@ async function saveAddEntry() {
   if (!amt) return notify('請輸入金額', 'err');
   let note = document.getElementById('f2-note').value.trim();
   const category = document.getElementById('f2-cat').value;
+  if (!category) return notify('請選擇分類（分類為必填）', 'err');
   const installment = document.getElementById('f2-installment').checked;
 
   const btn = document.getElementById('f2-save');
@@ -1382,47 +1504,54 @@ async function saveAddEntry() {
       return;
     }
 
-    // 2) 找空 row → 需要當月資料；若快取沒有則先抓
-    let rowIdx = null;
-    const cached = cacheGet(`month-${targetMonth}`);
-    if (cached && cached.MONTH_DATA && cached.MONTH_DATA[bankKey]) {
-      const usedRows = new Set(cached.MONTH_DATA[bankKey].map(it => it.rowIdx));
-      for (let r = 4; r <= 53; r++) if (!usedRows.has(r)) { rowIdx = r; break; }
+    // 2) 關鍵安全步驟：抓「目標月份」的實際結構（標題列），
+    //    取得這張卡在「該月份」真正的欄位，避免用到過期/寫死的錯誤欄位
+    const liveStruct = await fetchStructureOf(targetMonth);
+    let writeCol = null, cardColIdx = null;
+    if (liveStruct && liveStruct.banks) {
+      for (const b of liveStruct.banks) {
+        for (const c of b.cards) {
+          if (c.key === bankKey) { cardColIdx = c.colIdx; writeCol = idxToCol(c.colIdx); }
+        }
+      }
     }
-    if (!rowIdx) {
-      // 沒有快取 → 直接打 API 抓目標月份該卡的欄位看是否有空
-      rowIdx = await findEmptyRowRemote(targetMonth, bankKey);
+    if (!writeCol) {
+      // 找不到這張卡的欄位 → 不允許寫入（避免寫錯位置）
+      notify('找不到該卡在此月份的欄位，請確認月份分頁格式正確', 'err');
+      return;
     }
+
+    // 3) 找空 row（用 liveStruct 的欄位直接打 API 看該欄哪一列空）
+    const rowIdx = await findEmptyRowByCol(targetMonth, writeCol);
     if (!rowIdx) return notify('該卡 50 筆已滿，請刪除舊記錄', 'err');
 
-    // 3) 組備註的分期標記
+    // 4) 組備註的分期標記
     if (installment && !/\[分期\]/.test(note)) note = note ? `${note} [分期]` : '[分期]';
     if (!installment) note = note.replace(/\s*\[分期\]\s*/g, '').trim();
 
-    // 4) 寫入
-    const bank = BANKS_CARDS.find(b => b.key === bankKey);
-    const startCol = bank.col;
+    // 5) 寫入（用動態解析出的正確欄位）
+    const startCol = writeCol;
     const date = dateToMD(dateRaw);
     const range = `${targetMonth}!${startCol}${rowIdx}:${idxToCol(colToIdx(startCol)+3)}${rowIdx}`;
     await sheetUpdate(SHEET_ID, range, [[date, parseFloat(amt), note, category]]);
 
-    // 5) 套底色（分期 → 橘；否則照選色）
-    await applyRowColor(bankKey, rowIdx, installment ? 2 : SELECTED_COLOR_2, targetMonth);
+    // 6) 套底色（分期 → 橘；否則照選色）
+    await applyRowColorByCol(startCol, rowIdx, installment ? 2 : SELECTED_COLOR_2, targetMonth);
 
-    // 6) 共同飲食同步
+    // 7) 共同飲食同步
     if (category === '共同飲食') {
       await syncCommonFood(rowIdx, date, parseFloat(amt), note, targetMonth);
     }
 
     notify('✓ 已儲存', 'ok');
 
-    // 7) 清除該月份快取（因為資料變了）、若使用者切到儀表板/分析會重新抓
+    // 8) 清除該月份快取（因為資料變了）
     cacheRemove(`month-${targetMonth}`);
     if (targetMonth === CURRENT_MONTH) {
       MONTH_LOADED_FOR = ''; // 強制下次切過去時重抓
     }
 
-    // 8) 重置表單（保留月份、銀行/卡別）讓快速連續記帳
+    // 9) 重置表單（保留月份、銀行/卡別）讓快速連續記帳
     document.getElementById('f2-amt').value = '';
     document.getElementById('f2-note').value = '';
     document.getElementById('f2-installment').checked = false;
@@ -1437,9 +1566,57 @@ async function saveAddEntry() {
   }
 }
 
+// 抓某月份分頁的結構（只讀標題列相關資料）
+async function fetchStructureOf(monthKey) {
+  try {
+    const r = await retryWithAuth(() => gapi.client.sheets.spreadsheets.get({
+      spreadsheetId: SHEET_ID,
+      ranges: [`${monthKey}!A1:BL58`],
+      fields: 'sheets.data.rowData.values(formattedValue,effectiveValue)',
+    }));
+    const rowDataArr = r.result.sheets?.[0]?.data?.[0]?.rowData || [];
+    const rowsFull = [];
+    for (let i = 0; i < 58; i++) {
+      const cells = rowDataArr[i]?.values || [];
+      const rv = [];
+      for (let j = 0; j < 64; j++) {
+        const cell = cells[j] || {};
+        const ev = cell.effectiveValue;
+        let v = '';
+        if (ev) {
+          if ('numberValue' in ev) v = ev.numberValue;
+          else if ('stringValue' in ev) v = ev.stringValue;
+          else if ('boolValue' in ev) v = ev.boolValue;
+        } else if (cell.formattedValue !== undefined) v = cell.formattedValue;
+        rv.push(v);
+      }
+      rowsFull.push(rv);
+    }
+    return detectStructure(rowsFull);
+  } catch (e) {
+    console.warn('抓取月份結構失敗', e);
+    return null;
+  }
+}
+
+// 用欄位字母找該欄第一個空 row（4~53）
+async function findEmptyRowByCol(monthKey, col) {
+  try {
+    const r = await sheetGet(SHEET_ID, `${monthKey}!${col}4:${col}53`);
+    const vals = r.result.values || [];
+    for (let i = 0; i < 50; i++) {
+      const v = vals[i]?.[0];
+      if (v === '' || v == null) return i + 4;
+    }
+    return null;
+  } catch (e) {
+    return 4;
+  }
+}
+
 // 直接打 API 找指定月份+卡的空 row（沒快取時用）
 async function findEmptyRowRemote(monthKey, bankKey) {
-  const bank = BANKS_CARDS.find(b => b.key === bankKey);
+  const bank = getCards().find(b => b.key === bankKey);
   if (!bank) return null;
   const range = `${monthKey}!${bank.col}4:${bank.col}53`;
   try {
@@ -1461,7 +1638,7 @@ function renderDashboard() {
   // 全域加總
   let gTotal = 0, gRebate = 0, gPaid = 0, gPending = 0, gInstall = 0, gAccBalAccum = 0;
 
-  BANKS.forEach(b => {
+  getBanks().forEach(b => {
     const bd = BANK_DATA[b.key];
     if (!bd) return;
     gTotal += bd.total;
@@ -1475,13 +1652,14 @@ function renderDashboard() {
       gAccBalAccum += bd.accBal;
     }
   });
-  const gNet = gTotal - gRebate;
+  const gNet = gTotal; // total 已含負的抵扣回饋，不再額外扣
   const gAccBalTotal = gAccBalAccum - gPending;
 
   // KPI
-  let h = '<div class="kpi-grid">';
+  let h = '';
+  h += '<div class="kpi-grid">';
   h += `<div class="kpi-card"><div class="kpi-label">消費總計</div><div class="kpi-value">${fmtMoney(gTotal)}</div></div>`;
-  h += `<div class="kpi-card"><div class="kpi-label">回饋折抵</div><div class="kpi-value green">-${fmtMoney(gRebate)}</div></div>`;
+  h += `<div class="kpi-card"><div class="kpi-label">抵扣回饋</div><div class="kpi-value green">${fmtMoney(gRebate)}</div></div>`;
   h += `<div class="kpi-card"><div class="kpi-label">實際應付</div><div class="kpi-value">${fmtMoney(gNet)}</div></div>`;
   h += `<div class="kpi-card"><div class="kpi-label">已匯入現金</div><div class="kpi-value blue">${fmtMoney(gPaid)}</div></div>`;
   h += `<div class="kpi-card"><div class="kpi-label">待匯入繳款</div><div class="kpi-value red">${fmtMoney(gPending)}</div></div>`;
@@ -1496,7 +1674,7 @@ function renderDashboard() {
   </div>`;
   h += `<div class="bank-grid">`;
 
-  BANKS.forEach(b => {
+  getBanks().forEach(b => {
     const bd = BANK_DATA[b.key];
     if (!bd) return;
     if (bd.total === 0 && bd.paid === 0 && bd.install === 0 && bd.rebate === 0) return;
@@ -1520,7 +1698,7 @@ function renderDashboard() {
         </div>
         <div class="bank-line"><span>分期</span><span class="v ${bd.install?'orange':''}">${fmtMoney(bd.install)}</span></div>
         <div class="bank-line"><span>消費總計</span><span class="v">${fmtMoney(bd.total)}</span></div>
-        <div class="bank-line"><span>折抵</span><span class="v ${bd.rebate?'teal':''}">${bd.rebate?'-'+fmtMoney(bd.rebate):fmtMoney(0)}</span></div>
+        <div class="bank-line"><span>抵扣回饋</span><span class="v ${bd.rebate?'teal':''}">${fmtMoney(bd.rebate)}</span></div>
         <div class="bank-line"><span>繳費金額</span><span class="v">${fmtMoney(bd.net)}</span></div>
         <div class="bank-line"><span>已匯入</span><span class="v blue">${fmtMoney(bd.paid)}</span></div>
         <div class="bank-line highlight"><span>待繳</span><span class="v ${bd.pending>0?'red':'green'}">${fmtMoney(bd.pending)}</span></div>
@@ -1559,7 +1737,7 @@ function parseDateMD(s) {
 
 // ─── 切換已繳費（以「銀行」為單位，寫入 totalCol+'56' 的背景色）──
 async function togglePaid(bankKey, checked) {
-  const bank = BANKS.find(b => b.key === bankKey);
+  const bank = getBanks().find(b => b.key === bankKey);
   if (!bank) return;
   if (BANK_DATA[bankKey]) BANK_DATA[bankKey].isPaidCheck = checked;
   try {
@@ -1665,7 +1843,7 @@ function editEntry(cardKey, rowIdx) {
   const items = MONTH_DATA[cardKey] || [];
   const it = items.find(x => x.rowIdx === rowIdx);
   if (!it) return;
-  const card = BANKS_CARDS.find(c => c.key === cardKey);
+  const card = getCards().find(c => c.key === cardKey);
   if (!card) return;
   ensureModalFormReady();
   EDIT_TARGET = {bankKey: cardKey, rowIdx};
@@ -1707,7 +1885,7 @@ async function saveEntry() {
   if (installment && !/\[分期\]/.test(note)) note = note ? `${note} [分期]` : '[分期]';
   if (!installment) note = note.replace(/\s*\[分期\]\s*/g, '').trim();
 
-  const bank = BANKS_CARDS.find(b => b.key === bankKey);
+  const bank = getCards().find(b => b.key === bankKey);
   let rowIdx = EDIT_TARGET ? EDIT_TARGET.rowIdx : findEmptyRow(bankKey);
   if (!rowIdx) return notify('該卡 50 筆已滿，請刪除舊記錄', 'err');
 
@@ -1754,12 +1932,42 @@ function findEmptyRow(bankKey) {
   return null;
 }
 
+// 用欄位字母直接套底色（安全：不靠 bankKey 查寫死欄位）
+async function applyRowColorByCol(col, rowIdx, colorId, monthOverride) {
+  const color = COLORS.find(c => c.id === colorId);
+  if (!color) return;
+  const month = monthOverride || CURRENT_MONTH;
+  try {
+    const meta = await gapi.client.sheets.spreadsheets.get({ spreadsheetId: SHEET_ID });
+    const sheet = meta.result.sheets.find(s => s.properties.title === month);
+    if (!sheet) return;
+    const sheetId = sheet.properties.sheetId;
+    const startCol = colToIdx(col);
+    const endCol = startCol + 4;
+    const bgColor = color.hex ? hexToRgb(color.hex) : { red: 1, green: 1, blue: 1 };
+    await retryWithAuth(() => gapi.client.sheets.spreadsheets.batchUpdate({
+      spreadsheetId: SHEET_ID,
+      resource: {
+        requests: [{
+          repeatCell: {
+            range: { sheetId, startRowIndex: rowIdx - 1, endRowIndex: rowIdx, startColumnIndex: startCol, endColumnIndex: endCol },
+            cell: { userEnteredFormat: { backgroundColor: bgColor } },
+            fields: 'userEnteredFormat.backgroundColor',
+          }
+        }]
+      }
+    }));
+  } catch (e) {
+    console.warn('套用底色失敗', e);
+  }
+}
+
 async function applyRowColor(bankKey, rowIdx, colorId, monthOverride) {
   const color = COLORS.find(c => c.id === colorId);
   if (!color) return;
   const month = monthOverride || CURRENT_MONTH;
   try {
-    const bank = BANKS_CARDS.find(b => b.key === bankKey);
+    const bank = getCards().find(b => b.key === bankKey);
     const meta = await gapi.client.sheets.spreadsheets.get({spreadsheetId: SHEET_ID});
     const sheet = meta.result.sheets.find(s => s.properties.title === month);
     if (!sheet) return;
@@ -1794,7 +2002,7 @@ async function deleteEntry() {
   if (!EDIT_TARGET) return;
   if (!confirm('確定刪除這筆記錄？')) return;
   const {bankKey, rowIdx} = EDIT_TARGET;
-  const bank = BANKS_CARDS.find(b => b.key === bankKey);
+  const bank = getCards().find(b => b.key === bankKey);
   const range = `${CURRENT_MONTH}!${bank.col}${rowIdx}:${idxToCol(colToIdx(bank.col)+3)}${rowIdx}`;
   try {
     await sheetUpdate(SHEET_ID, range, [['', '', '', '']]);
@@ -1866,12 +2074,18 @@ function renderPieContent() {
   const panel = document.getElementById('analysis-pie-panel');
   if (!panel) return;
 
-  // 收集所有消費（排除「其他代墊」，負數也計入）
+  // 收集所有消費（排除「其他代墊」；抵扣回饋另外獨立統計）
   const catMap = {};
+  let rebateTotal = 0;
   Object.values(MONTH_DATA).forEach(items => {
     (items || []).forEach(it => {
-      if (it.category === '其他代墊' || it.amount === 0) return;
-      const cat = it.category || '其他';
+      if (it.amount === 0) return;
+      const cat = (it.category || '其他').trim();
+      if (cat === REBATE_CATEGORY) {        // 抵扣回饋：獨立累計（負數）
+        rebateTotal += it.amount;
+        return;
+      }
+      if (cat === '其他代墊') return;
       catMap[cat] = (catMap[cat] || 0) + it.amount;
     });
   });
@@ -1893,7 +2107,7 @@ function renderPieContent() {
     }
   });
 
-  if (!essItems.length && !nessItems.length) {
+  if (!essItems.length && !nessItems.length && rebateTotal === 0) {
     panel.innerHTML = `<div class="empty"><div class="empty-icon">📊</div><p>本月還沒有資料可分析</p></div>`;
     return;
   }
@@ -1945,6 +2159,20 @@ function renderPieContent() {
 
   if (essItems.length)  h += buildCatSection('必須花費明細',  'e', essItems,  essTotal,  grandTotal, ESS_COLORS);
   if (nessItems.length) h += buildCatSection('非必須花費明細', 'n', nessItems, nessTotal, grandTotal, NESS_COLORS);
+
+  // 第 3 區塊：抵扣回饋（獨立，不進圓餅圖與總消費）
+  if (rebateTotal !== 0) {
+    h += `<div class="cat-section">
+      <span class="cat-section-title r">抵扣回饋</span>
+      <table class="cat-table">
+        <tr class="cat-subtotal">
+          <td>累計抵扣回饋</td>
+          <td class="r teal">${fmtMoney(rebateTotal)}</td>
+        </tr>
+      </table>
+      <div style="font-size:11px;color:var(--fg3);padding:6px 2px 0">此區為回饋抵扣累計，不計入上方總消費與圓餅圖</div>
+    </div>`;
+  }
 
   h += `</div></div>`;
 
@@ -2063,7 +2291,7 @@ async function renderTrends() {
       const rowDataArr = r.result.sheets?.[0]?.data?.[0]?.rowData || [];
       let total = 0, ess = 0, non = 0;
 
-      BANKS_CARDS.forEach(card => {
+      getCards().forEach(card => {
         const aIdx = colToIdx(card.col) + 1;
         const ccIdx = colToIdx(card.col) + 3;
         for (let i = 0; i < 50; i++) {
