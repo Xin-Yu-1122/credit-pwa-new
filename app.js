@@ -1122,26 +1122,37 @@ function parseMonthDataDynamic(rowsFull, bgsFull, struct) {
       MONTH_DATA[card.key] = items;
     });
 
-    // 銀行繳費欄位：
-    //   餘額  = 銀行起欄, row57 (rowsFull[56])
-    //   已匯入 = 銀行起欄, row58 (rowsFull[57])
-    //   現金特殊：A56 總計, A57 餘額
-    let paid = 0, accBalRaw = 0, isPaidCheck = false;
+    // 銀行繳費欄位（v3.1 修正）：
+    //   row57 = 已匯入金額
+    //   row58 = 待繳款餘額（試算表公式：帳戶餘額 - 消費總計）
+    //           >= 0 → 待繳款 = row58、帳戶餘額 = 0
+    //           <  0 → 待繳款 = 0、帳戶餘額 = |row58|
+    //   現金特殊：A56=總計(顯示用)、A57=目前現金，無待繳/已匯入概念
+    let paid = 0, pending = 0, accBalRaw = 0, accBal = 0, isPaidCheck = false;
     if (bank.key === 'cash') {
       const cashTotal = parseAmount((rowsFull[55] || [])[0]); // A56
-      accBalRaw = parseAmount((rowsFull[56] || [])[0]) || 0;   // A57
       if (cashTotal != null) total = cashTotal;
+      accBalRaw = parseAmount((rowsFull[56] || [])[0]) || 0;   // A57 = 目前現金
+      accBal = accBalRaw;
       paid = 0;
+      pending = 0;
     } else {
-      accBalRaw = parseAmount((rowsFull[56] || [])[bank.colIdx]) || 0; // row57
-      paid = parseAmount((rowsFull[57] || [])[bank.colIdx]) || 0;      // row58
+      paid = parseAmount((rowsFull[56] || [])[bank.colIdx]) || 0; // row57 = 已匯入
+      const r58 = parseAmount((rowsFull[57] || [])[bank.colIdx]) || 0; // row58 = 待繳款餘額
+      if (r58 >= 0) {
+        pending = r58;
+        accBalRaw = 0;
+        accBal = 0;
+      } else {
+        pending = 0;
+        accBalRaw = r58;          // 負數
+        accBal = Math.abs(r58);   // 帳戶餘額（取絕對值）
+      }
       const r56bg = (bgsFull[55] || [])[bank.colIdx];
       isPaidCheck = isPaidGray(r56bg);
     }
-    const accBal = accBalRaw < 0 ? Math.abs(accBalRaw) : 0;
-    // total 已含負的抵扣回饋（你會自行調整試算表小計公式），net 不再額外扣 rebate
+    // total 已含負的抵扣回饋（試算表小計公式自行處理），net 不再額外扣 rebate
     const net = total;
-    const pending = bank.key === 'cash' ? 0 : Math.max(0, net - paid);
 
     BANK_DATA[bank.key] = {
       total, rebate, install, paid, accBalRaw, accBal,
@@ -1645,11 +1656,11 @@ function renderDashboard() {
     gRebate += bd.rebate;
     gInstall += bd.install;
     if (b.isCash) {
-      gAccBalAccum += bd.paid;
+      gAccBalAccum += bd.accBal; // 現金 = A57 目前現金
     } else {
       gPaid += bd.paid;
       gPending += bd.pending;
-      gAccBalAccum += bd.accBal;
+      gAccBalAccum += bd.accBal; // 銀行帳戶餘額（row58 為負時的溢繳額）
     }
   });
   const gNet = gTotal; // total 已含負的抵扣回饋，不再額外扣
@@ -1677,18 +1688,19 @@ function renderDashboard() {
   getBanks().forEach(b => {
     const bd = BANK_DATA[b.key];
     if (!bd) return;
-    if (bd.total === 0 && bd.paid === 0 && bd.install === 0 && bd.rebate === 0) return;
-
     if (b.isCash) {
+      // 現金卡：有總計或現金值才顯示
+      if (bd.total === 0 && bd.accBal === 0) return;
       h += `<div class="card-row">
         <div class="bank-head">
           <div class="bank-name">${b.name}</div>
         </div>
         <div class="bank-line"><span>消費總計</span><span class="v">${fmtMoney(bd.total)}</span></div>
         <div class="bank-line divider"></div>
-        <div class="bank-line"><span>目前現金</span><span class="v green">${fmtMoney(bd.paid)}</span></div>
+        <div class="bank-line"><span>目前現金</span><span class="v green">${fmtMoney(bd.accBal)}</span></div>
       </div>`;
     } else {
+      if (bd.total === 0 && bd.paid === 0 && bd.install === 0 && bd.rebate === 0 && bd.pending === 0 && bd.accBal === 0) return;
       const isPaid = bd.isPaidCheck;
       h += `<div class="card-row ${isPaid?'paid':''}">
         <div class="paid-badge">✓ 已繳</div>
@@ -1699,7 +1711,6 @@ function renderDashboard() {
         <div class="bank-line"><span>分期</span><span class="v ${bd.install?'orange':''}">${fmtMoney(bd.install)}</span></div>
         <div class="bank-line"><span>消費總計</span><span class="v">${fmtMoney(bd.total)}</span></div>
         <div class="bank-line"><span>抵扣回饋</span><span class="v ${bd.rebate?'teal':''}">${fmtMoney(bd.rebate)}</span></div>
-        <div class="bank-line"><span>繳費金額</span><span class="v">${fmtMoney(bd.net)}</span></div>
         <div class="bank-line"><span>已匯入</span><span class="v blue">${fmtMoney(bd.paid)}</span></div>
         <div class="bank-line highlight"><span>待繳</span><span class="v ${bd.pending>0?'red':'green'}">${fmtMoney(bd.pending)}</span></div>
         <div class="bank-line sub"><span>帳戶餘額</span><span class="v">${fmtMoney(bd.accBal)}</span></div>
