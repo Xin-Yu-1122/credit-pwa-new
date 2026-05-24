@@ -1174,6 +1174,7 @@ function syncDynamicToGlobals(struct) {
       name: b.name.split('(')[0].split('（')[0].trim(),
       isCash: b.key === 'cash',
       _colIdx: b.colIdx,
+      totalCol: idxToCol(b.colIdx),
     });
     b.cards.forEach(c => {
       newCards.push({
