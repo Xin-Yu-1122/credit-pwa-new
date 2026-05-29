@@ -1,10 +1,21 @@
 // ─────────────────────────────────────────────────────────────
 // 信用卡記帳 PWA - 主邏輯
 // ─────────────────────────────────────────────────────────────
+// 版本歷史
+// v3.2.1  2026-05-29  修改：
+//   - 移除灰色底色選項（小更動）
+//
+// v3.2  2026-05-29  修改：
+//   - 新增「已結帳」勾選框（儀表板），自動換月到下月（記帳 Tab）
+//   - 修復：togglePaid bug（bank.totalCol 缺失）
+//   - 新增 nextYYMM、isBankBilled 等輔助函式（中型更動）
+//
+// v3.1  版本基礎
+// ─────────────────────────────────────────────────────────────
 
 const CLIENT_ID = '144262693536-poq7p69eo0aqr3r0onjafrd2f1rfrmg3.apps.googleusercontent.com';
 const SCOPES = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file';
-const APP_VERSION = 'v3.2';
+const APP_VERSION = 'v3.2.1';
 
 // 9 個銀行（用於儀表板顯示與計算）
 // totalCol = 該銀行總計欄(row 56)；paidCol/accBalCol = 在 row 57 該銀行的「已匯入」「帳戶餘額」位置
@@ -64,7 +75,6 @@ const COLORS = [
   {id:5, name:'藍', hex:'#64B5F6'},
   {id:6, name:'紫', hex:'#BA68C8'},
   {id:7, name:'粉', hex:'#F48FB1'},
-  {id:8, name:'灰', hex:'#B0BEC5'},
 ];
 
 // 預設分類（從試算表「帳務類型」分頁讀取後會覆蓋）
