@@ -4,7 +4,7 @@
 
 const CLIENT_ID = '144262693536-poq7p69eo0aqr3r0onjafrd2f1rfrmg3.apps.googleusercontent.com';
 const SCOPES = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file';
-const APP_VERSION = 'v3.1';
+const APP_VERSION = 'v3.2';
 
 // 9 個銀行（用於儀表板顯示與計算）
 // totalCol = 該銀行總計欄(row 56)；paidCol/accBalCol = 在 row 57 該銀行的「已匯入」「帳戶餘額」位置
@@ -152,6 +152,12 @@ const CACHE_TTL = {
 
 function todayYYMM() {
   const d = new Date();
+  return `${String(d.getFullYear()).slice(2)}_${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+
+function nextYYMM(yymm) {
+  const [yy, mm] = yymm.split('_').map(Number);
+  const d = new Date(2000 + yy, mm, 1); // mm as 0-based index of next month
   return `${String(d.getFullYear()).slice(2)}_${String(d.getMonth() + 1).padStart(2, '0')}`;
 }
 
@@ -1320,6 +1326,11 @@ function renderAddTab() {
         </select>
       </div>
 
+      <div id="f2-billed-notice" style="display:none;margin:-4px 0 10px;padding:10px 12px;background:rgba(255,153,0,0.1);border:1px solid rgba(255,153,0,0.5);border-radius:8px;font-size:13px;color:var(--fg1,#222);line-height:1.5">
+        <span id="f2-billed-notice-text"></span>
+        <button onclick="dismissBilledNotice()" style="display:block;margin-top:6px;border:none;background:rgba(0,0,0,0.08);color:var(--fg2,#555);cursor:pointer;font-size:12px;padding:4px 10px;border-radius:6px;width:100%">← 改回本月</button>
+      </div>
+
       <div class="field hidden" id="f2-card-field">
         <label>卡別</label>
         <select class="inp" id="f2-card"></select>
@@ -1427,6 +1438,7 @@ function onBankGroupChange2() {
   if (!bankKey) {
     cardField.classList.add('hidden');
     cardSel.innerHTML = '';
+    hideBilledNotice();
     return;
   }
   const cards = getCards().filter(c => c.bankKey === bankKey);
@@ -1442,6 +1454,56 @@ function onBankGroupChange2() {
     const def = BANK_DEFAULT_CARD[bankKey] || cards[0]?.key;
     cardSel.value = def;
   }
+
+  // 已結帳自動換月邏輯
+  if (isBankBilled(bankKey)) {
+    const nm = nextYYMM(CURRENT_MONTH);
+    const monthSel = document.getElementById('f2-month');
+    if (monthSel) {
+      // 確保下個月選項存在
+      if (!monthSel.querySelector(`option[value="${nm}"]`)) {
+        const [yy, mm] = nm.split('_');
+        const opt = document.createElement('option');
+        opt.value = nm;
+        opt.textContent = `20${yy}/${mm}（待建立）`;
+        monthSel.prepend(opt);
+      }
+      monthSel.value = nm;
+    }
+    const bankName = getBanks().find(b => b.key === bankKey)?.name || bankKey;
+    const [yy, mm] = nm.split('_');
+    const months = window.AVAILABLE_MONTHS || [];
+    const notExist = !months.includes(nm);
+    const noticeText = document.getElementById('f2-billed-notice-text');
+    const notice = document.getElementById('f2-billed-notice');
+    if (noticeText) {
+      noticeText.textContent = `[${bankName} 已結帳] 月份已自動切換到 20${yy}/${mm}` +
+        (notExist ? ` — ⚠️ 請先在試算表新增 ${nm} 分頁` : '');
+    }
+    if (notice) notice.style.display = 'block';
+  } else {
+    hideBilledNotice();
+  }
+}
+
+function hideBilledNotice() {
+  const notice = document.getElementById('f2-billed-notice');
+  if (notice) notice.style.display = 'none';
+}
+
+function dismissBilledNotice() {
+  const monthSel = document.getElementById('f2-month');
+  if (monthSel) {
+    // 移除暫時加入的「待建立」選項（如果不在 AVAILABLE_MONTHS 裡）
+    const nm = nextYYMM(CURRENT_MONTH);
+    const months = window.AVAILABLE_MONTHS || [];
+    if (!months.includes(nm)) {
+      const opt = monthSel.querySelector(`option[value="${nm}"]`);
+      if (opt) opt.remove();
+    }
+    monthSel.value = CURRENT_MONTH;
+  }
+  hideBilledNotice();
 }
 
 function onInstallmentChange2() {
@@ -1715,6 +1777,7 @@ function renderDashboard() {
         <div class="bank-line"><span>已匯入</span><span class="v blue">${fmtMoney(bd.paid)}</span></div>
         <div class="bank-line highlight"><span>待繳</span><span class="v ${bd.pending>0?'red':'green'}">${fmtMoney(bd.pending)}</span></div>
         <div class="bank-line sub"><span>帳戶餘額</span><span class="v">${fmtMoney(bd.accBal)}</span></div>
+        <label class="chk-paid" style="color:var(--orange,#f90);margin-bottom:4px"><input type="checkbox" ${isBankBilled(b.key)?'checked':''} onchange="toggleBilled('${b.key}',this.checked)"/> 已結帳</label>
         <label class="chk-paid"><input type="checkbox" ${isPaid?'checked':''} onchange="togglePaid('${b.key}',this.checked)"/> 已繳費</label>
       </div>`;
     }
@@ -1745,6 +1808,20 @@ function parseDateMD(s) {
   const m = String(s).match(/(\d+)\/(\d+)/);
   if (!m) return 0;
   return parseInt(m[1]) * 100 + parseInt(m[2]);
+}
+
+// ─── 已結帳狀態（localStorage，每月獨立，不寫入試算表）──────
+function billedStorageKey() { return `billed-banks-${CURRENT_MONTH}`; }
+function getBilledBanks() {
+  try { return new Set(JSON.parse(localStorage.getItem(billedStorageKey()) || '[]')); }
+  catch { return new Set(); }
+}
+function isBankBilled(bankKey) { return getBilledBanks().has(bankKey); }
+function toggleBilled(bankKey, checked) {
+  const set = getBilledBanks();
+  checked ? set.add(bankKey) : set.delete(bankKey);
+  localStorage.setItem(billedStorageKey(), JSON.stringify([...set]));
+  renderTab();
 }
 
 // ─── 切換已繳費（以「銀行」為單位，寫入 totalCol+'56' 的背景色）──
