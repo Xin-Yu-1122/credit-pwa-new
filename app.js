@@ -2,6 +2,11 @@
 // 信用卡記帳 PWA - 主邏輯
 // ─────────────────────────────────────────────────────────────
 // 版本歷史
+// v3.3  2026-05-30  修改：
+//   - 「已結帳」狀態改寫入試算表 row55 銀行起始欄背景色(#FFF2CC)，
+//     取代原 localStorage 做法，達成跨裝置同步（中型更動）
+//   - 讀取月份時一併解析 row55 背景色 → BANK_DATA.isBilledCheck
+//
 // v3.2.1  2026-05-29  修改：
 //   - 移除灰色底色選項（小更動）
 //
@@ -15,7 +20,7 @@
 
 const CLIENT_ID = '144262693536-poq7p69eo0aqr3r0onjafrd2f1rfrmg3.apps.googleusercontent.com';
 const SCOPES = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file';
-const APP_VERSION = 'v3.2.1';
+const APP_VERSION = 'v3.3';
 
 // 9 個銀行（用於儀表板顯示與計算）
 // totalCol = 該銀行總計欄(row 56)；paidCol/accBalCol = 在 row 57 該銀行的「已匯入」「帳戶餘額」位置
@@ -1004,6 +1009,7 @@ function colorClose(bg, r, g, b, tol) {
 }
 function isOrange(bg) { return colorClose(bg, 1, 0.6, 0); }       // #ff9900
 function isPaidGray(bg) { return colorClose(bg, 0.7176, 0.7176, 0.7176); } // #b7b7b7
+function isBilledColor(bg) { return colorClose(bg, 1, 0.9490, 0.8); } // #FFF2CC（已結帳）
 
 // ═══════════════════════════════════════════════════════════
 // v3.0 動態結構引擎
@@ -1144,7 +1150,7 @@ function parseMonthDataDynamic(rowsFull, bgsFull, struct) {
     //           >= 0 → 待繳款 = row58、帳戶餘額 = 0
     //           <  0 → 待繳款 = 0、帳戶餘額 = |row58|
     //   現金特殊：A56=總計(顯示用)、A57=目前現金，無待繳/已匯入概念
-    let paid = 0, pending = 0, accBalRaw = 0, accBal = 0, isPaidCheck = false;
+    let paid = 0, pending = 0, accBalRaw = 0, accBal = 0, isPaidCheck = false, isBilledCheck = false;
     if (bank.key === 'cash') {
       const cashTotal = parseAmount((rowsFull[55] || [])[0]); // A56
       if (cashTotal != null) total = cashTotal;
@@ -1166,13 +1172,15 @@ function parseMonthDataDynamic(rowsFull, bgsFull, struct) {
       }
       const r56bg = (bgsFull[55] || [])[bank.colIdx];
       isPaidCheck = isPaidGray(r56bg);
+      const r55bg = (bgsFull[54] || [])[bank.colIdx]; // row55 銀行起始欄背景色 = 已結帳
+      isBilledCheck = isBilledColor(r55bg);
     }
     // total 已含負的抵扣回饋（試算表小計公式自行處理），net 不再額外扣 rebate
     const net = total;
 
     BANK_DATA[bank.key] = {
       total, rebate, install, paid, accBalRaw, accBal,
-      net, pending, isPaidCheck,
+      net, pending, isPaidCheck, isBilledCheck,
       _name: bank.name, _cards: bank.cards.map(c => ({ key: c.key, name: c.name })),
     };
   });
@@ -1820,18 +1828,43 @@ function parseDateMD(s) {
   return parseInt(m[1]) * 100 + parseInt(m[2]);
 }
 
-// ─── 已結帳狀態（localStorage，每月獨立，不寫入試算表）──────
-function billedStorageKey() { return `billed-banks-${CURRENT_MONTH}`; }
-function getBilledBanks() {
-  try { return new Set(JSON.parse(localStorage.getItem(billedStorageKey()) || '[]')); }
-  catch { return new Set(); }
-}
-function isBankBilled(bankKey) { return getBilledBanks().has(bankKey); }
-function toggleBilled(bankKey, checked) {
-  const set = getBilledBanks();
-  checked ? set.add(bankKey) : set.delete(bankKey);
-  localStorage.setItem(billedStorageKey(), JSON.stringify([...set]));
+// ─── 已結帳狀態（寫入試算表 row55 銀行起始欄背景色，跨裝置同步）──
+// 讀取：fetchAndParseMonth 解析 row55 背景色 → BANK_DATA[].isBilledCheck
+function isBankBilled(bankKey) { return !!(BANK_DATA[bankKey] && BANK_DATA[bankKey].isBilledCheck); }
+
+async function toggleBilled(bankKey, checked) {
+  const bank = getBanks().find(b => b.key === bankKey);
+  if (!bank || bank.isCash) return;
+  if (BANK_DATA[bankKey]) BANK_DATA[bankKey].isBilledCheck = checked;
   renderTab();
+  try {
+    const meta = await gapi.client.sheets.spreadsheets.get({spreadsheetId: SHEET_ID});
+    const sheet = meta.result.sheets.find(s => s.properties.title === CURRENT_MONTH);
+    if (!sheet) throw new Error('找不到月份分頁');
+    const sheetId = sheet.properties.sheetId;
+    const totalIdx = colToIdx(bank.totalCol);
+    const bgColor = checked ? {red:1, green:0.9490, blue:0.8} : {red:1, green:1, blue:1}; // #FFF2CC or white
+
+    await retryWithAuth(() => gapi.client.sheets.spreadsheets.batchUpdate({
+      spreadsheetId: SHEET_ID,
+      resource: {
+        requests: [{
+          repeatCell: {
+            range: {sheetId, startRowIndex: 54, endRowIndex: 55, startColumnIndex: totalIdx, endColumnIndex: totalIdx + 1},
+            cell: {userEnteredFormat: {backgroundColor: bgColor}},
+            fields: 'userEnteredFormat.backgroundColor',
+          }
+        }]
+      }
+    }));
+    notify(checked ? '✓ 已標記結帳' : '已取消結帳標記', 'ok');
+    renderTab();
+  } catch (e) {
+    notify('更新失敗', 'err');
+    console.error(e);
+    if (BANK_DATA[bankKey]) BANK_DATA[bankKey].isBilledCheck = !checked;
+    renderTab();
+  }
 }
 
 // ─── 切換已繳費（以「銀行」為單位，寫入 totalCol+'56' 的背景色）──
