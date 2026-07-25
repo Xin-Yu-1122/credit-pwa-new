@@ -2,6 +2,19 @@
 // 信用卡記帳 PWA - 主邏輯
 // ─────────────────────────────────────────────────────────────
 // 版本歷史
+// v3.6  2026-07-26  修正（中型更動）：
+//   - 修正「最近十筆排序完全失效」：日期欄在試算表是真正的日期格，
+//     effectiveValue 回傳的是序號（例 46226 = 2026-07-23），不是 "M/D" 文字。
+//     v3.5 的 mdSortKey 對序號完全不匹配 → 所有列排序鍵都是 0 → 退化成 rowIdx 排序
+//   - 新增 sheetSerialToISO() / normalizeDateCell()：序號、YYYY/M/D、M/D 三種都能解析
+//     解析結果同時存 date(M/D) 與 dateISO(YYYY-MM-DD)，排序改用 dateISO
+//   - 修正「現金沒顯示日期」：同上，現金欄是日期格，原本直接印出序號
+//   - 清單改為跨月：涵蓋目前月份 + 下個月（結帳後新帳務寫在下個月，
+//     原本只讀 CURRENT_MONTH 所以永遠看不到最新的）；跨月列標橘色月份標籤
+//   - 新增 fetchMonthEntries()：非破壞式讀取其他月份，不覆寫全域 MONTH_DATA
+//   - 長按跨月的列會先自動切換月份再開編輯視窗（openRecentEdit）
+//   - 編輯視窗的日期改優先用 dateISO，跨年週期也不會填錯年份
+//
 // v3.5  2026-07-25  新增（中型更動）：
 //   - 記帳 Tab 下方新增「最近十筆」可摺疊清單（摺疊狀態記於 localStorage）
 //   - 資料源＝記憶體中的 MONTH_DATA，排序零額外 API 呼叫
@@ -39,7 +52,7 @@
 
 const CLIENT_ID = '144262693536-poq7p69eo0aqr3r0onjafrd2f1rfrmg3.apps.googleusercontent.com';
 const SCOPES = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file';
-const APP_VERSION = 'v3.5';
+const APP_VERSION = 'v3.6';
 
 // 9 個銀行（用於儀表板顯示與計算）
 // totalCol = 該銀行總計欄(row 56)；paidCol/accBalCol = 在 row 57 該銀行的「已匯入」「帳戶餘額」位置
@@ -761,6 +774,7 @@ function populateMonthSelector() {
       const sel = document.getElementById('f2-month');
       if (sel) sel.value = newVal;
       MONTH_MANUALLY_SET = true;      // 使用者主動換月 → 不再自動覆蓋
+      RECENT_XTRA = {};
       renderRecentList();
       if (!isRecentCollapsed()) ensureRecentListData();
     }
@@ -966,7 +980,7 @@ async function fetchAndParseMonth(monthKey) {
     // ── v3.1 動態解析（一律新格式，不再做新舊偵測）──
     const detected = detectStructure(rowsFull);
     LAST_STRUCT = detected;
-    parseMonthDataDynamic(rowsFull, bgsFull, detected);
+    parseMonthDataDynamic(rowsFull, bgsFull, detected, monthKey);
     syncBilledStateFrom(monthKey);
 
     // 寫入快取
@@ -1131,7 +1145,7 @@ function makeCardKey(bankKey, rawName, seq) {
 
 // 動態解析（v3.1）
 const REBATE_CATEGORY = '抵扣回饋'; // 特殊分類：抵扣回饋（記負數，獨立統計）
-function parseMonthDataDynamic(rowsFull, bgsFull, struct) {
+function parseMonthDataDynamic(rowsFull, bgsFull, struct, monthKey) {
   MONTH_DATA = {};
   BANK_DATA = {};
   // 資料列 row4~row54 → rowsFull[3]~rowsFull[53]（51 筆，row54 不再是折抵）
@@ -1147,7 +1161,9 @@ function parseMonthDataDynamic(rowsFull, bgsFull, struct) {
       const items = [];
       for (let i = 0; i < 51; i++) { // row4~54 = 51 列
         const r = rowsFull[3 + i] || [];
-        const date = (r[cIdx] === '' || r[cIdx] == null) ? '' : r[cIdx];
+        const _dRaw = (r[cIdx] === '' || r[cIdx] == null) ? '' : r[cIdx];
+        const _d = normalizeDateCell(_dRaw, monthKey);
+        const date = _d.md;
         const amountRaw = r[aIdx];
         const note = r[nIdx] || '';
         const category = r[ccIdx] || '';
@@ -1157,7 +1173,7 @@ function parseMonthDataDynamic(rowsFull, bgsFull, struct) {
         const isInst = /\[分期\]/.test(String(note)) || isOrange(cellBg);
         const isRebate = String(category).trim() === REBATE_CATEGORY;
         items.push({
-          rowIdx: i + 4, date, amount: amt || 0, note, category,
+          rowIdx: i + 4, date, dateISO: _d.iso, amount: amt || 0, note, category,
           installment: isInst, isRebate,
         });
         if (amt && amt !== 0) {
@@ -1593,6 +1609,9 @@ function dismissBilledNotice() {
 // 排序：消費日期新→舊；同日以 rowIdx 大者優先（記帳往下附加，越大越晚寫入）
 const RECENT_LIMIT = 10;
 const RECENT_COLLAPSE_KEY = 'recent-list-collapsed';
+// 結帳後新記錄會寫進「下個月」分頁，所以清單必須跨月，否則永遠看不到最新的
+let RECENT_XTRA = {};              // { monthKey: {ts, entries} }（不覆寫全域 MONTH_DATA）
+const RECENT_XTRA_TTL = 3 * 60 * 1000;
 
 function isRecentCollapsed() { return localStorage.getItem(RECENT_COLLAPSE_KEY) === '1'; }
 
@@ -1612,21 +1631,67 @@ function toggleRecentList() {
   if (!nowCollapsed) { renderRecentList(); ensureRecentListData(); }
 }
 
-// M/D → 可排序的 YYYYMMDD。信用卡週期會跨月甚至跨年（例：26_01 分頁含 12/22）
-function mdSortKey(md, monthKey) {
-  const m = String(md || '').match(/(\d+)\/(\d+)/);
-  if (!m) return 0;
-  const mo = parseInt(m[1]), d = parseInt(m[2]);
-  const mk = monthKey || todayYYMM();
-  let year = 2000 + parseInt(mk.split('_')[0]);
-  const sheetMo = parseInt(mk.split('_')[1]);
-  const diff = mo - sheetMo;
-  if (diff > 6) year -= 1;        // 26_01 分頁裡的 12/22 → 2025-12-22
-  else if (diff < -6) year += 1;
-  return year * 10000 + mo * 100 + d;
+// 清單要涵蓋的月份：目前月份 + 下個月（結帳後的記錄會落在下個月）
+function recentMonthScope() {
+  const months = [CURRENT_MONTH];
+  const nm = nextYYMM(CURRENT_MONTH);
+  if ((window.AVAILABLE_MONTHS || []).includes(nm)) months.push(nm);
+  return months;
 }
 
-function getRecentEntries(limit) {
+// 非破壞式讀取某月份的所有記錄（不動全域 MONTH_DATA/BANK_DATA）
+async function fetchMonthEntries(monthKey) {
+  const r = await retryWithAuth(() => gapi.client.sheets.spreadsheets.get({
+    spreadsheetId: SHEET_ID,
+    ranges: [`${monthKey}!A1:BL54`],
+    fields: 'sheets.data.rowData.values(formattedValue,effectiveValue,effectiveFormat.backgroundColor)',
+  }));
+  const rowDataArr = r.result.sheets?.[0]?.data?.[0]?.rowData || [];
+  const rowsFull = [], bgsFull = [];
+  for (let i = 0; i < 54; i++) {
+    const cells = rowDataArr[i]?.values || [];
+    const rv = [], rb = [];
+    for (let j = 0; j < 64; j++) {
+      const cell = cells[j] || {};
+      const ev = cell.effectiveValue;
+      let v = '';
+      if (ev) {
+        if ('numberValue' in ev) v = ev.numberValue;
+        else if ('stringValue' in ev) v = ev.stringValue;
+      } else if (cell.formattedValue !== undefined) v = cell.formattedValue;
+      rv.push(v);
+      rb.push(cell.effectiveFormat?.backgroundColor || null);
+    }
+    rowsFull.push(rv); bgsFull.push(rb);
+  }
+  const struct = detectStructure(rowsFull);
+  const out = [];
+  struct.banks.forEach(b => {
+    const bankName = b.name.split('(')[0].split('（')[0].trim();
+    b.cards.forEach(card => {
+      const cIdx = card.colIdx, aIdx = cIdx + 1, nIdx = cIdx + 2, ccIdx = cIdx + 3;
+      for (let i = 0; i < 51; i++) {
+        const rr = rowsFull[3 + i] || [];
+        const raw = (rr[cIdx] === '' || rr[cIdx] == null) ? '' : rr[cIdx];
+        const amt = parseAmount(rr[aIdx]);
+        const note = rr[nIdx] || '';
+        const category = rr[ccIdx] || '';
+        if ((amt === null || amt === 0) && !raw && !note) continue;
+        const d = normalizeDateCell(raw, monthKey);
+        out.push({
+          monthKey, cardKey: card.key, rowIdx: i + 4,
+          date: d.md, dateISO: d.iso, amount: amt || 0, note, category,
+          isRebate: String(category).trim() === REBATE_CATEGORY,
+          bankName, cardName: card.name,
+        });
+      }
+    });
+  });
+  return out;
+}
+
+// 合併目前月份（記憶體中的 MONTH_DATA）＋其他月份（RECENT_XTRA），依實際日期排序
+function collectRecentEntries(limit) {
   const cards = getCards();
   const out = [];
   Object.keys(MONTH_DATA || {}).forEach(cardKey => {
@@ -1634,14 +1699,24 @@ function getRecentEntries(limit) {
     (MONTH_DATA[cardKey] || []).forEach(it => {
       if (!it.date && !it.amount && !it.note) return;
       out.push({
-        cardKey, rowIdx: it.rowIdx, date: it.date, amount: it.amount,
-        note: it.note, category: it.category, isRebate: it.isRebate,
+        monthKey: CURRENT_MONTH, cardKey, rowIdx: it.rowIdx,
+        date: it.date,
+        dateISO: it.dateISO || normalizeDateCell(it.date, CURRENT_MONTH).iso,
+        amount: it.amount, note: it.note, category: it.category, isRebate: it.isRebate,
         bankName: card ? card.bank : '', cardName: card ? card.name : cardKey,
-        _k: mdSortKey(it.date, CURRENT_MONTH),
       });
     });
   });
-  out.sort((a, b) => (b._k - a._k) || (b.rowIdx - a.rowIdx));
+  Object.keys(RECENT_XTRA).forEach(mk => {
+    if (mk === CURRENT_MONTH) return;
+    (RECENT_XTRA[mk]?.entries || []).forEach(e => out.push(e));
+  });
+  out.sort((a, b) => {
+    const ka = a.dateISO || '', kb = b.dateISO || '';
+    if (ka !== kb) return kb.localeCompare(ka);          // 有日期的新→舊，無日期的排最後
+    if (a.monthKey !== b.monthKey) return b.monthKey.localeCompare(a.monthKey);
+    return b.rowIdx - a.rowIdx;                           // 同日以後寫入的優先
+  });
   return out.slice(0, limit || RECENT_LIMIT);
 }
 
@@ -1657,26 +1732,31 @@ function renderRecentList() {
     return;
   }
 
-  const list = getRecentEntries(RECENT_LIMIT);
-  const [myy, mmm] = (CURRENT_MONTH || '').split('_');
+  const list = collectRecentEntries(RECENT_LIMIT);
+  const scope = recentMonthScope().map(m => {
+    const [y, mm] = m.split('_'); return `20${y}/${mm}`;
+  }).join(' + ');
   if (!list.length) {
-    body.innerHTML = `<div style="padding:10px 0;color:var(--fg2);font-size:13px">20${myy}/${mmm} 還沒有任何記錄</div>`;
+    body.innerHTML = `<div style="padding:10px 0;color:var(--fg2);font-size:13px">${scope} 還沒有任何記錄</div>`;
     return;
   }
 
-  let h = `<div style="font-size:11px;color:var(--fg2);margin-bottom:8px">20${myy}/${mmm} · 長按可編輯</div>`;
+  let h = `<div style="font-size:11px;color:var(--fg2);margin-bottom:8px">${scope} · 長按可編輯</div>`;
   list.forEach(e => {
     const neg = e.amount < 0 || e.isRebate;
     const amtColor = neg ? 'var(--teal,#0d9488)' : 'var(--fg1)';
     const who = [e.bankName, e.cardName].filter(Boolean).join(' ');
-    h += `<div class="recent-row" data-card="${e.cardKey}" data-row="${e.rowIdx}"
+    const other = e.monthKey !== CURRENT_MONTH;
+    const [oy, om] = e.monthKey.split('_');
+    h += `<div class="recent-row" data-month="${e.monthKey}" data-card="${e.cardKey}" data-row="${e.rowIdx}"
       style="padding:9px 0;border-top:1px solid rgba(0,0,0,0.07);user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;transition:background .12s;border-radius:6px">
       <div style="display:flex;align-items:baseline;gap:8px">
-        <span style="font-size:12px;color:var(--fg2);min-width:38px">${e.date || '—'}</span>
+        <span style="font-size:12px;color:var(--fg2);min-width:40px;white-space:nowrap">${e.date || '—'}</span>
         <span style="font-size:13px;color:var(--fg1);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${who}</span>
         <span style="font-size:14px;font-weight:700;color:${amtColor};white-space:nowrap">${fmtMoney(e.amount)}</span>
       </div>
-      <div style="display:flex;align-items:center;gap:6px;margin-top:3px;padding-left:46px">
+      <div style="display:flex;align-items:center;gap:6px;margin-top:3px;padding-left:48px">
+        ${other ? `<span style="font-size:10px;padding:1px 6px;border-radius:99px;background:rgba(255,153,0,.15);color:#b46a00;white-space:nowrap">20${oy}/${om}</span>` : ''}
         ${e.category ? `<span style="font-size:11px;padding:1px 7px;border-radius:99px;background:rgba(0,0,0,0.06);color:var(--fg2);white-space:nowrap">${e.category}</span>` : ''}
         ${e.note ? `<span style="font-size:11px;color:var(--fg2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${e.note}</span>` : ''}
       </div>
@@ -1690,6 +1770,7 @@ function renderRecentList() {
 function attachRecentLongPress() {
   document.querySelectorAll('.recent-row').forEach(row => {
     let timer = null;
+    const monthKey = row.dataset.month;
     const cardKey = row.dataset.card;
     const rowIdx = parseInt(row.dataset.row, 10);
     const start = () => {
@@ -1698,7 +1779,7 @@ function attachRecentLongPress() {
         timer = null;
         row.style.background = '';
         if (navigator.vibrate) { try { navigator.vibrate(30); } catch {} }
-        editEntry(cardKey, rowIdx);
+        openRecentEdit(monthKey, cardKey, rowIdx);
       }, 550);
     };
     const cancel = () => {
@@ -1716,38 +1797,74 @@ function attachRecentLongPress() {
   });
 }
 
-// 展開時確保資料已載入；走快取優先，且「不呼叫 renderTab」以免清掉表單
-async function ensureRecentListData() {
-  if (MONTH_LOADED_FOR === CURRENT_MONTH && Object.keys(MONTH_DATA || {}).length) return;
-  const monthKey = CURRENT_MONTH;
-  const cached = cacheGet(`month-${monthKey}`);
-  if (cached && cached.MONTH_DATA && cached.BANK_DATA) {
-    MONTH_DATA = cached.MONTH_DATA;
-    BANK_DATA = cached.BANK_DATA;
-    LAST_STRUCT = cached._struct || null;
-    if (LAST_STRUCT) syncDynamicToGlobals(LAST_STRUCT);
-    MONTH_LOADED_FOR = monthKey;
-    MONTH_DATA_IS_STALE = true;
-    syncBilledStateFrom(monthKey);
-    renderRecentList();
-    // 背景靜默刷新
-    fetchAndParseMonth(monthKey).then(() => {
-      if (CURRENT_MONTH === monthKey && CURRENT_TAB === 'add') renderRecentList();
-    }).catch(e => console.warn('背景刷新失敗', e));
-    return;
-  }
+// 編輯視窗只吃 CURRENT_MONTH 的資料；若該筆屬於別的月份，先切換月份再開
+async function openRecentEdit(monthKey, cardKey, rowIdx) {
+  if (monthKey === CURRENT_MONTH) return editEntry(cardKey, rowIdx);
+  const [y, m] = monthKey.split('_');
+  notify(`切換到 20${y}/${m} …`, 'ok');
+  CURRENT_MONTH = monthKey;
+  csSetValue('cs-month-wrap', monthKey);
+  RECENT_XTRA = {};
+  MONTH_LOADED_FOR = '';
   try {
     await fetchAndParseMonth(monthKey);
-    if (CURRENT_MONTH !== monthKey) return;
     MONTH_LOADED_FOR = monthKey;
-    MONTH_DATA_IS_STALE = false;
-    if (CURRENT_TAB === 'add') renderRecentList();
+    renderRecentList();
+    ensureRecentListData();
+    editEntry(cardKey, rowIdx);
   } catch (e) {
-    console.warn('載入最近記錄失敗', e);
-    const body = document.getElementById('recent-body');
-    if (body && !isRecentCollapsed()) {
-      body.innerHTML = `<div style="padding:10px 0;color:var(--fg2);font-size:13px">載入失敗 —
-        <span onclick="ensureRecentListData()" style="color:var(--blue,#2563eb);cursor:pointer">重試</span></div>`;
+    notify('切換月份失敗', 'err');
+    console.error(e);
+  }
+}
+
+// 展開時確保資料已載入；走快取優先，且「不呼叫 renderTab」以免清掉表單
+async function ensureRecentListData() {
+  const monthKey = CURRENT_MONTH;
+  if (!(MONTH_LOADED_FOR === monthKey && Object.keys(MONTH_DATA || {}).length)) {
+    const cached = cacheGet(`month-${monthKey}`);
+    if (cached && cached.MONTH_DATA && cached.BANK_DATA) {
+      MONTH_DATA = cached.MONTH_DATA;
+      BANK_DATA = cached.BANK_DATA;
+      LAST_STRUCT = cached._struct || null;
+      if (LAST_STRUCT) syncDynamicToGlobals(LAST_STRUCT);
+      MONTH_LOADED_FOR = monthKey;
+      MONTH_DATA_IS_STALE = true;
+      syncBilledStateFrom(monthKey);
+      renderRecentList();
+      fetchAndParseMonth(monthKey).then(() => {
+        if (CURRENT_MONTH === monthKey && CURRENT_TAB === 'add') renderRecentList();
+      }).catch(e => console.warn('背景刷新失敗', e));
+    } else {
+      try {
+        await fetchAndParseMonth(monthKey);
+        if (CURRENT_MONTH !== monthKey) return;
+        MONTH_LOADED_FOR = monthKey;
+        MONTH_DATA_IS_STALE = false;
+        if (CURRENT_TAB === 'add') renderRecentList();
+      } catch (e) {
+        console.warn('載入最近記錄失敗', e);
+        const body = document.getElementById('recent-body');
+        if (body && !isRecentCollapsed()) {
+          body.innerHTML = `<div style="padding:10px 0;color:var(--fg2);font-size:13px">載入失敗 —
+            <span onclick="ensureRecentListData()" style="color:var(--blue,#2563eb);cursor:pointer">重試</span></div>`;
+        }
+        return;
+      }
+    }
+  }
+  // 再補抓「下個月」的記錄（結帳後的新帳務在那裡）
+  for (const mk of recentMonthScope()) {
+    if (mk === monthKey) continue;
+    const hit = RECENT_XTRA[mk];
+    if (hit && Date.now() - hit.ts < RECENT_XTRA_TTL) continue;
+    try {
+      const entries = await fetchMonthEntries(mk);
+      RECENT_XTRA[mk] = { ts: Date.now(), entries };
+      if (CURRENT_MONTH === monthKey && CURRENT_TAB === 'add') renderRecentList();
+    } catch (e) {
+      console.warn('讀取跨月記錄失敗', mk, e);
+      RECENT_XTRA[mk] = { ts: Date.now(), entries: [] };
     }
   }
 }
@@ -2236,6 +2353,47 @@ function mdToDate(md, refMonth) {
   return `${year}-${String(m[1]).padStart(2,'0')}-${String(m[2]).padStart(2,'0')}`;
 }
 
+// ─── 日期正規化（v3.6）─────────────────────────────────────
+// 試算表的日期欄可能是「真正的日期格」→ effectiveValue 回傳序號（例 46226），
+// 也可能是文字（例 "7/22"）。兩種都要能解析。
+function sheetSerialToISO(n) {
+  const num = Number(n);
+  if (!isFinite(num) || num < 20000 || num > 80000) return ''; // 合理日期序號範圍
+  const ms = Date.UTC(1899, 11, 30) + Math.floor(num) * 86400000;
+  const d = new Date(ms);
+  if (isNaN(d.getTime())) return '';
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')}`;
+}
+
+// 回傳 { md:'M/D', iso:'YYYY-MM-DD' }；解析不出來就回空字串
+function normalizeDateCell(v, monthKey) {
+  if (v === '' || v == null) return { md: '', iso: '' };
+  // (a) 日期序號
+  const iso = sheetSerialToISO(v);
+  if (iso) {
+    const [y, m, d] = iso.split('-');
+    return { md: `${parseInt(m)}/${parseInt(d)}`, iso };
+  }
+  const s = String(v).trim();
+  // (b) YYYY/M/D 或 YYYY-M-D
+  let m1 = s.match(/^(\d{4})[-\/](\d{1,2})[-\/](\d{1,2})$/);
+  if (m1) {
+    const y = m1[1], mo = parseInt(m1[2]), d = parseInt(m1[3]);
+    return { md: `${mo}/${d}`, iso: `${y}-${String(mo).padStart(2,'0')}-${String(d).padStart(2,'0')}` };
+  }
+  // (c) M/D（年份由分頁月份推算，處理跨年週期）
+  let m2 = s.match(/^(\d{1,2})[-\/](\d{1,2})$/);
+  if (m2) {
+    const mo = parseInt(m2[1]), d = parseInt(m2[2]);
+    const mk = monthKey || todayYYMM();
+    let y = 2000 + parseInt(mk.split('_')[0]);
+    const diff = mo - parseInt(mk.split('_')[1]);
+    if (diff > 6) y -= 1; else if (diff < -6) y += 1;
+    return { md: `${mo}/${d}`, iso: `${y}-${String(mo).padStart(2,'0')}-${String(d).padStart(2,'0')}` };
+  }
+  return { md: s, iso: '' };
+}
+
 function populateFormMonthSelector(disabled) {
   const sel = document.getElementById('f-month');
   sel.innerHTML = (window.AVAILABLE_MONTHS || defaultMonthsList()).map(m => {
@@ -2300,7 +2458,7 @@ function editEntry(cardKey, rowIdx) {
   document.getElementById('f-card').value = cardKey;
   document.getElementById('f-card').disabled = true;
   document.getElementById('f-month').value = CURRENT_MONTH;
-  document.getElementById('f-date').value = mdToDate(it.date, CURRENT_MONTH);
+  document.getElementById('f-date').value = it.dateISO || mdToDate(it.date, CURRENT_MONTH);
   document.getElementById('f-amt').value = it.amount;
   document.getElementById('f-note').value = (it.note || '').replace(/\s*\[分期\]\s*/g, '').trim();
   document.getElementById('f-cat').value = it.category || '';
