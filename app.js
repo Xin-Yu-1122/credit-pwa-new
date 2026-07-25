@@ -2,6 +2,16 @@
 // 信用卡記帳 PWA - 主邏輯
 // ─────────────────────────────────────────────────────────────
 // 版本歷史
+// v3.4  2026-07-25  修正（中型更動）：
+//   - 修正「已結帳卻沒自動帶下個月」：自動換月的基準由 CURRENT_MONTH 改為
+//     todayYYMM()。原本記帳存到八月後 CURRENT_MONTH 會被改成八月，導致之後
+//     讀到八月（未結帳）的狀態、且目標月份算成九月，自動換月整個失效。
+//   - 已結帳狀態改存於獨立的 BILLED_STATE（以月份為 key）+ localStorage 快取，
+//     不再依賴 BANK_DATA；新增 ensureBilledState() 於狀態未載入時只讀
+//     row1/row2/row55（成本極低），修正「未進儀表板時判斷永遠為 false」
+//   - 新增 MONTH_MANUALLY_SET：使用者手動改過月份後不再自動覆蓋
+//   - 提示文字改為顯示結帳基準月份，「改回」按鈕動態顯示月份
+//
 // v3.3  2026-05-30  修改：
 //   - 「已結帳」狀態改寫入試算表 row55 銀行起始欄背景色(#FFF2CC)，
 //     取代原 localStorage 做法，達成跨裝置同步（中型更動）
@@ -20,7 +30,7 @@
 
 const CLIENT_ID = '144262693536-poq7p69eo0aqr3r0onjafrd2f1rfrmg3.apps.googleusercontent.com';
 const SCOPES = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file';
-const APP_VERSION = 'v3.3';
+const APP_VERSION = 'v3.4';
 
 // 9 個銀行（用於儀表板顯示與計算）
 // totalCol = 該銀行總計欄(row 56)；paidCol/accBalCol = 在 row 57 該銀行的「已匯入」「帳戶餘額」位置
@@ -620,6 +630,9 @@ async function initApp() {
   CURRENT_MONTH = todayYYMM();
   CURRENT_TAB = 'add';
 
+  // 1b) 讀取已結帳狀態快取（試算表仍是真正的來源，這只是加速用）
+  loadBilledStateCache();
+
   // 2) 從快取讀分類；沒快取就用程式內預設（CATEGORIES 已有預設值）
   const cachedCats = cacheGet('categories');
   if (cachedCats && cachedCats.length) CATEGORIES = cachedCats;
@@ -870,6 +883,7 @@ async function loadCurrentMonth() {
     if (LAST_STRUCT) syncDynamicToGlobals(LAST_STRUCT);
     MONTH_LOADED_FOR = monthKey;
     MONTH_DATA_IS_STALE = true;
+    syncBilledStateFrom(monthKey);
     renderTab(); // 立刻渲染快取資料
     // 背景靜默刷新
     fetchAndParseMonth(monthKey).then(() => {
@@ -940,6 +954,7 @@ async function fetchAndParseMonth(monthKey) {
     const detected = detectStructure(rowsFull);
     LAST_STRUCT = detected;
     parseMonthDataDynamic(rowsFull, bgsFull, detected);
+    syncBilledStateFrom(monthKey);
 
     // 寫入快取
     if (CURRENT_MONTH === monthKey) {
@@ -1333,7 +1348,7 @@ function renderAddTab() {
 
       <div class="field">
         <label>月份分頁</label>
-        <select class="inp" id="f2-month"></select>
+        <select class="inp" id="f2-month" onchange="onAddMonthChange2()"></select>
       </div>
 
       <div class="field">
@@ -1346,7 +1361,7 @@ function renderAddTab() {
 
       <div id="f2-billed-notice" style="display:none;margin:-4px 0 10px;padding:10px 12px;background:rgba(255,153,0,0.1);border:1px solid rgba(255,153,0,0.5);border-radius:8px;font-size:13px;color:var(--fg1,#222);line-height:1.5">
         <span id="f2-billed-notice-text"></span>
-        <button onclick="dismissBilledNotice()" style="display:block;margin-top:6px;border:none;background:rgba(0,0,0,0.08);color:var(--fg2,#555);cursor:pointer;font-size:12px;padding:4px 10px;border-radius:6px;width:100%">← 改回本月</button>
+        <button id="f2-billed-back" onclick="dismissBilledNotice()" style="display:block;margin-top:6px;border:none;background:rgba(0,0,0,0.08);color:var(--fg2,#555);cursor:pointer;font-size:12px;padding:4px 10px;border-radius:6px;width:100%">← 改回本月</button>
       </div>
 
       <div class="field hidden" id="f2-card-field">
@@ -1397,10 +1412,14 @@ function renderAddTab() {
   // 填入月份下拉、預設今天
   updateAddMonthOptions();
   document.getElementById('f2-month').value = monthDefault;
+  MONTH_MANUALLY_SET = false;   // 新表單 → 回到自動模式
 
   // 渲染色卡
   renderAddColorPicker();
   selectColor2(0);
+
+  // 預先載入「今天所屬月份」的已結帳狀態，讓選銀行時能立即判斷
+  ensureBilledState(todayYYMM());
 }
 
 function updateAddMonthOptions() {
@@ -1473,35 +1492,53 @@ function onBankGroupChange2() {
     cardSel.value = def;
   }
 
-  // 已結帳自動換月邏輯
-  if (isBankBilled(bankKey)) {
-    const nm = nextYYMM(CURRENT_MONTH);
-    const monthSel = document.getElementById('f2-month');
-    if (monthSel) {
-      // 確保下個月選項存在
-      if (!monthSel.querySelector(`option[value="${nm}"]`)) {
-        const [yy, mm] = nm.split('_');
-        const opt = document.createElement('option');
-        opt.value = nm;
-        opt.textContent = `20${yy}/${mm}（待建立）`;
-        monthSel.prepend(opt);
-      }
-      monthSel.value = nm;
-    }
-    const bankName = getBanks().find(b => b.key === bankKey)?.name || bankKey;
-    const [yy, mm] = nm.split('_');
-    const months = window.AVAILABLE_MONTHS || [];
-    const notExist = !months.includes(nm);
-    const noticeText = document.getElementById('f2-billed-notice-text');
-    const notice = document.getElementById('f2-billed-notice');
-    if (noticeText) {
-      noticeText.textContent = `[${bankName} 已結帳] 月份已自動切換到 20${yy}/${mm}` +
-        (notExist ? ` — ⚠️ 請先在試算表新增 ${nm} 分頁` : '');
-    }
-    if (notice) notice.style.display = 'block';
-  } else {
-    hideBilledNotice();
+  // 已結帳自動換月邏輯（v3.4：一律以「今天所屬月份」為基準）
+  applyBilledAutoMonth(bankKey);
+}
+
+// 使用者是否已手動指定過月份（手動指定就不再自動覆蓋）
+let MONTH_MANUALLY_SET = false;
+function onAddMonthChange2() { MONTH_MANUALLY_SET = true; hideBilledNotice(); }
+
+async function applyBilledAutoMonth(bankKey) {
+  const monthSel = document.getElementById('f2-month');
+  if (!monthSel || !bankKey) return;
+  const baseMonth = todayYYMM();                 // 基準＝今天所屬月份，不是 CURRENT_MONTH
+  const nm = nextYYMM(baseMonth);
+
+  // 使用者已手動改過月份 → 尊重使用者，不覆蓋
+  if (MONTH_MANUALLY_SET) { hideBilledNotice(); return; }
+
+  await ensureBilledState(baseMonth);            // 確保狀態已載入（未載入才打 API）
+  // 等待期間使用者可能已改動選單或換銀行
+  if (document.getElementById('f2-bankgroup')?.value !== bankKey) return;
+  if (MONTH_MANUALLY_SET) return;
+
+  if (!isBankBilledIn(baseMonth, bankKey)) { hideBilledNotice(); return; }
+
+  // 確保下個月選項存在
+  if (!monthSel.querySelector(`option[value="${nm}"]`)) {
+    const [y, m] = nm.split('_');
+    const opt = document.createElement('option');
+    opt.value = nm;
+    opt.textContent = `20${y}/${m}（待建立）`;
+    monthSel.prepend(opt);
   }
+  monthSel.value = nm;
+
+  const bankName = getBanks().find(b => b.key === bankKey)?.name || bankKey;
+  const [yy, mm] = nm.split('_');
+  const [byy, bmm] = baseMonth.split('_');
+  const notExist = !(window.AVAILABLE_MONTHS || []).includes(nm);
+  const noticeText = document.getElementById('f2-billed-notice-text');
+  const notice = document.getElementById('f2-billed-notice');
+  if (noticeText) {
+    noticeText.textContent = `[${bankName} 20${byy}/${bmm} 已結帳] 月份已自動切換到 20${yy}/${mm}` +
+      (notExist ? ` — ⚠️ 請先在試算表新增 ${nm} 分頁` : '');
+  }
+  const btn = document.getElementById('f2-billed-back');
+  if (btn) btn.textContent = `← 改回 20${byy}/${bmm}`;
+  if (notice) notice.style.display = 'block';
 }
 
 function hideBilledNotice() {
@@ -1511,16 +1548,17 @@ function hideBilledNotice() {
 
 function dismissBilledNotice() {
   const monthSel = document.getElementById('f2-month');
+  const baseMonth = todayYYMM();
   if (monthSel) {
     // 移除暫時加入的「待建立」選項（如果不在 AVAILABLE_MONTHS 裡）
-    const nm = nextYYMM(CURRENT_MONTH);
-    const months = window.AVAILABLE_MONTHS || [];
-    if (!months.includes(nm)) {
+    const nm = nextYYMM(baseMonth);
+    if (!(window.AVAILABLE_MONTHS || []).includes(nm)) {
       const opt = monthSel.querySelector(`option[value="${nm}"]`);
       if (opt) opt.remove();
     }
-    monthSel.value = CURRENT_MONTH;
+    monthSel.value = baseMonth;
   }
+  MONTH_MANUALLY_SET = true;   // 使用者明確要求改回，之後不再自動切換
   hideBilledNotice();
 }
 
@@ -1795,7 +1833,7 @@ function renderDashboard() {
         <div class="bank-line"><span>已匯入</span><span class="v blue">${fmtMoney(bd.paid)}</span></div>
         <div class="bank-line highlight"><span>待繳</span><span class="v ${bd.pending>0?'red':'green'}">${fmtMoney(bd.pending)}</span></div>
         <div class="bank-line sub"><span>帳戶餘額</span><span class="v">${fmtMoney(bd.accBal)}</span></div>
-        <label class="chk-paid" style="color:var(--orange,#f90);margin-bottom:4px"><input type="checkbox" ${isBankBilled(b.key)?'checked':''} onchange="toggleBilled('${b.key}',this.checked)"/> 已結帳</label>
+        <label class="chk-paid" style="color:var(--orange,#f90);margin-bottom:4px"><input type="checkbox" ${isBankBilledIn(CURRENT_MONTH, b.key)?'checked':''} onchange="toggleBilled('${b.key}',this.checked)"/> 已結帳</label>
         <label class="chk-paid"><input type="checkbox" ${isPaid?'checked':''} onchange="togglePaid('${b.key}',this.checked)"/> 已繳費</label>
       </div>`;
     }
@@ -1829,13 +1867,92 @@ function parseDateMD(s) {
 }
 
 // ─── 已結帳狀態（寫入試算表 row55 銀行起始欄背景色，跨裝置同步）──
-// 讀取：fetchAndParseMonth 解析 row55 背景色 → BANK_DATA[].isBilledCheck
-function isBankBilled(bankKey) { return !!(BANK_DATA[bankKey] && BANK_DATA[bankKey].isBilledCheck); }
+// v3.4：狀態改用「以月份為 key」的獨立 store，不再依賴 BANK_DATA（BANK_DATA 只
+// 反映「目前檢視中的月份」，一旦 CURRENT_MONTH 被改動就會讀錯月份的結帳狀態）
+// BILLED_STATE = { 'YY_MM': ['fb','es', ...] }
+let BILLED_STATE = {};
+const BILLED_CACHE_KEY = 'billed-state-cache';
+
+function loadBilledStateCache() {
+  try {
+    const raw = localStorage.getItem(BILLED_CACHE_KEY);
+    if (raw) BILLED_STATE = JSON.parse(raw) || {};
+  } catch { BILLED_STATE = {}; }
+}
+function persistBilledStateCache() {
+  try { localStorage.setItem(BILLED_CACHE_KEY, JSON.stringify(BILLED_STATE)); } catch {}
+}
+
+// 由已解析好的 BANK_DATA 同步某月份的結帳狀態
+function syncBilledStateFrom(monthKey) {
+  if (!monthKey) return;
+  const keys = Object.keys(BANK_DATA).filter(k => BANK_DATA[k] && BANK_DATA[k].isBilledCheck);
+  BILLED_STATE[monthKey] = keys;
+  persistBilledStateCache();
+}
+
+// 確保某月份的結帳狀態已載入（沒有就只讀 row1/row2/row55，成本極低）
+async function ensureBilledState(monthKey) {
+  if (!monthKey || BILLED_STATE[monthKey] !== undefined) return;
+  if (!SHEET_ID || !GAPI_READY) return;
+  try {
+    const r = await retryWithAuth(() => gapi.client.sheets.spreadsheets.get({
+      spreadsheetId: SHEET_ID,
+      ranges: [`${monthKey}!A1:BL2`, `${monthKey}!A55:BL55`],
+      fields: 'sheets.data.rowData.values(formattedValue,effectiveValue,effectiveFormat.backgroundColor)',
+    }));
+    const dataArr = r.result.sheets?.[0]?.data || [];
+    // 第一段 = row1~2 的值（給 detectStructure 用）
+    const headRows = [];
+    for (let i = 0; i < 2; i++) {
+      const cells = dataArr[0]?.rowData?.[i]?.values || [];
+      const rv = [];
+      for (let j = 0; j < 64; j++) {
+        const cell = cells[j] || {};
+        const ev = cell.effectiveValue;
+        let v = '';
+        if (ev) {
+          if ('stringValue' in ev) v = ev.stringValue;
+          else if ('numberValue' in ev) v = ev.numberValue;
+        } else if (cell.formattedValue !== undefined) v = cell.formattedValue;
+        rv.push(v);
+      }
+      headRows.push(rv);
+    }
+    // 第二段 = row55 的背景色
+    const r55cells = dataArr[1]?.rowData?.[0]?.values || [];
+    const struct = detectStructure(headRows);
+    const keys = [];
+    struct.banks.forEach(b => {
+      if (b.key === 'cash') return;
+      const bg = r55cells[b.colIdx]?.effectiveFormat?.backgroundColor || null;
+      if (isBilledColor(bg)) keys.push(b.key);
+    });
+    BILLED_STATE[monthKey] = keys;
+    persistBilledStateCache();
+  } catch (e) {
+    // 分頁不存在或讀取失敗 → 記為空陣列，避免每次都重打 API
+    console.warn('讀取已結帳狀態失敗', monthKey, e);
+    BILLED_STATE[monthKey] = [];
+  }
+}
+
+function isBankBilledIn(monthKey, bankKey) {
+  const arr = BILLED_STATE[monthKey];
+  return Array.isArray(arr) && arr.includes(bankKey);
+}
+// 自動換月判斷一律以「今天所屬月份」為準，而非目前檢視中的月份
+function isBankBilled(bankKey) { return isBankBilledIn(todayYYMM(), bankKey); }
 
 async function toggleBilled(bankKey, checked) {
   const bank = getBanks().find(b => b.key === bankKey);
   if (!bank || bank.isCash) return;
   if (BANK_DATA[bankKey]) BANK_DATA[bankKey].isBilledCheck = checked;
+  // 同步更新該月份的 store（勾選框屬於「目前檢視的月份」）
+  const arr = new Set(BILLED_STATE[CURRENT_MONTH] || []);
+  checked ? arr.add(bankKey) : arr.delete(bankKey);
+  BILLED_STATE[CURRENT_MONTH] = [...arr];
+  persistBilledStateCache();
   renderTab();
   try {
     const meta = await gapi.client.sheets.spreadsheets.get({spreadsheetId: SHEET_ID});
@@ -1863,6 +1980,10 @@ async function toggleBilled(bankKey, checked) {
     notify('更新失敗', 'err');
     console.error(e);
     if (BANK_DATA[bankKey]) BANK_DATA[bankKey].isBilledCheck = !checked;
+    const back = new Set(BILLED_STATE[CURRENT_MONTH] || []);
+    checked ? back.delete(bankKey) : back.add(bankKey);
+    BILLED_STATE[CURRENT_MONTH] = [...back];
+    persistBilledStateCache();
     renderTab();
   }
 }
