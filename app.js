@@ -2,6 +2,15 @@
 // 信用卡記帳 PWA - 主邏輯
 // ─────────────────────────────────────────────────────────────
 // 版本歷史
+// v3.5  2026-07-25  新增（中型更動）：
+//   - 記帳 Tab 下方新增「最近十筆」可摺疊清單（摺疊狀態記於 localStorage）
+//   - 資料源＝記憶體中的 MONTH_DATA，排序零額外 API 呼叫
+//     排序規則：消費日期新→舊，同日以 rowIdx 大者優先
+//   - mdSortKey()：M/D 補上年份推算，處理跨年週期（如 26_01 分頁含 12/22）
+//   - 長按 550ms 開啟既有編輯視窗（含刪除），touch/mouse 雙支援、擋 contextmenu
+//   - renderRecentList() 只重繪清單區塊，不呼叫 renderTab，避免清掉表單輸入
+//   - ensureRecentListData()：快取優先 + 背景刷新，維持記帳 Tab 不等 API 的特性
+//
 // v3.4  2026-07-25  修正（中型更動）：
 //   - 修正「已結帳卻沒自動帶下個月」：自動換月的基準由 CURRENT_MONTH 改為
 //     todayYYMM()。原本記帳存到八月後 CURRENT_MONTH 會被改成八月，導致之後
@@ -30,7 +39,7 @@
 
 const CLIENT_ID = '144262693536-poq7p69eo0aqr3r0onjafrd2f1rfrmg3.apps.googleusercontent.com';
 const SCOPES = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file';
-const APP_VERSION = 'v3.4';
+const APP_VERSION = 'v3.5';
 
 // 9 個銀行（用於儀表板顯示與計算）
 // totalCol = 該銀行總計欄(row 56)；paidCol/accBalCol = 在 row 57 該銀行的「已匯入」「帳戶餘額」位置
@@ -751,6 +760,9 @@ function populateMonthSelector() {
     if (CURRENT_TAB === 'add') {
       const sel = document.getElementById('f2-month');
       if (sel) sel.value = newVal;
+      MONTH_MANUALLY_SET = true;      // 使用者主動換月 → 不再自動覆蓋
+      renderRecentList();
+      if (!isRecentCollapsed()) ensureRecentListData();
     }
   });
 }
@@ -891,6 +903,7 @@ async function loadCurrentMonth() {
       if (CURRENT_MONTH === monthKey) {
         MONTH_DATA_IS_STALE = false;
         if (CURRENT_TAB === 'dashboard' || CURRENT_TAB === 'analysis') renderTab();
+        else if (CURRENT_TAB === 'add') renderRecentList(); // 只重繪清單，保留表單內容
       }
     }).catch(e => console.warn('背景刷新月份失敗', e));
     return;
@@ -1407,6 +1420,14 @@ function renderAddTab() {
       <button class="btn btn-primary" id="f2-save" onclick="saveAddEntry()" style="width:100%;margin-top:18px;padding:15px;font-size:16px;font-weight:700">儲存</button>
       <button class="btn btn-ghost" onclick="resetAddForm()" style="width:100%;margin-top:10px">清除</button>
     </div>
+
+    <div class="card" style="padding:0;margin-bottom:12px;overflow:hidden">
+      <div id="recent-toggle" onclick="toggleRecentList()" style="display:flex;align-items:center;justify-content:space-between;padding:14px 16px;cursor:pointer;user-select:none;-webkit-user-select:none">
+        <span style="font-size:15px;font-weight:600;color:var(--fg1)">🕘 最近十筆</span>
+        <span id="recent-caret" style="font-size:13px;color:var(--fg2);transition:transform .15s">▾</span>
+      </div>
+      <div id="recent-body" style="padding:0 16px 12px"></div>
+    </div>
   `;
 
   // 填入月份下拉、預設今天
@@ -1420,6 +1441,11 @@ function renderAddTab() {
 
   // 預先載入「今天所屬月份」的已結帳狀態，讓選銀行時能立即判斷
   ensureBilledState(todayYYMM());
+
+  // 最近十筆（可摺疊；展開時才載入資料）
+  applyRecentCollapse();
+  renderRecentList();
+  if (!isRecentCollapsed()) ensureRecentListData();
 }
 
 function updateAddMonthOptions() {
@@ -1560,6 +1586,170 @@ function dismissBilledNotice() {
   }
   MONTH_MANUALLY_SET = true;   // 使用者明確要求改回，之後不再自動切換
   hideBilledNotice();
+}
+
+// ─── 最近十筆記錄（v3.5）────────────────────────────────────
+// 資料來源＝記憶體中的 MONTH_DATA（CURRENT_MONTH），排序不需額外 API
+// 排序：消費日期新→舊；同日以 rowIdx 大者優先（記帳往下附加，越大越晚寫入）
+const RECENT_LIMIT = 10;
+const RECENT_COLLAPSE_KEY = 'recent-list-collapsed';
+
+function isRecentCollapsed() { return localStorage.getItem(RECENT_COLLAPSE_KEY) === '1'; }
+
+function applyRecentCollapse() {
+  const body = document.getElementById('recent-body');
+  const caret = document.getElementById('recent-caret');
+  if (!body) return;
+  const collapsed = isRecentCollapsed();
+  body.style.display = collapsed ? 'none' : 'block';
+  if (caret) caret.textContent = collapsed ? '▸' : '▾';
+}
+
+function toggleRecentList() {
+  const nowCollapsed = !isRecentCollapsed();
+  localStorage.setItem(RECENT_COLLAPSE_KEY, nowCollapsed ? '1' : '0');
+  applyRecentCollapse();
+  if (!nowCollapsed) { renderRecentList(); ensureRecentListData(); }
+}
+
+// M/D → 可排序的 YYYYMMDD。信用卡週期會跨月甚至跨年（例：26_01 分頁含 12/22）
+function mdSortKey(md, monthKey) {
+  const m = String(md || '').match(/(\d+)\/(\d+)/);
+  if (!m) return 0;
+  const mo = parseInt(m[1]), d = parseInt(m[2]);
+  const mk = monthKey || todayYYMM();
+  let year = 2000 + parseInt(mk.split('_')[0]);
+  const sheetMo = parseInt(mk.split('_')[1]);
+  const diff = mo - sheetMo;
+  if (diff > 6) year -= 1;        // 26_01 分頁裡的 12/22 → 2025-12-22
+  else if (diff < -6) year += 1;
+  return year * 10000 + mo * 100 + d;
+}
+
+function getRecentEntries(limit) {
+  const cards = getCards();
+  const out = [];
+  Object.keys(MONTH_DATA || {}).forEach(cardKey => {
+    const card = cards.find(c => c.key === cardKey);
+    (MONTH_DATA[cardKey] || []).forEach(it => {
+      if (!it.date && !it.amount && !it.note) return;
+      out.push({
+        cardKey, rowIdx: it.rowIdx, date: it.date, amount: it.amount,
+        note: it.note, category: it.category, isRebate: it.isRebate,
+        bankName: card ? card.bank : '', cardName: card ? card.name : cardKey,
+        _k: mdSortKey(it.date, CURRENT_MONTH),
+      });
+    });
+  });
+  out.sort((a, b) => (b._k - a._k) || (b.rowIdx - a.rowIdx));
+  return out.slice(0, limit || RECENT_LIMIT);
+}
+
+// 只重繪清單區塊，絕不動表單（避免清掉使用者正在輸入的內容）
+function renderRecentList() {
+  const body = document.getElementById('recent-body');
+  if (!body) return;
+  if (isRecentCollapsed()) return;
+
+  const loaded = MONTH_LOADED_FOR === CURRENT_MONTH && Object.keys(MONTH_DATA || {}).length;
+  if (!loaded) {
+    body.innerHTML = `<div style="padding:10px 0;color:var(--fg2);font-size:13px">載入中…</div>`;
+    return;
+  }
+
+  const list = getRecentEntries(RECENT_LIMIT);
+  const [myy, mmm] = (CURRENT_MONTH || '').split('_');
+  if (!list.length) {
+    body.innerHTML = `<div style="padding:10px 0;color:var(--fg2);font-size:13px">20${myy}/${mmm} 還沒有任何記錄</div>`;
+    return;
+  }
+
+  let h = `<div style="font-size:11px;color:var(--fg2);margin-bottom:8px">20${myy}/${mmm} · 長按可編輯</div>`;
+  list.forEach(e => {
+    const neg = e.amount < 0 || e.isRebate;
+    const amtColor = neg ? 'var(--teal,#0d9488)' : 'var(--fg1)';
+    const who = [e.bankName, e.cardName].filter(Boolean).join(' ');
+    h += `<div class="recent-row" data-card="${e.cardKey}" data-row="${e.rowIdx}"
+      style="padding:9px 0;border-top:1px solid rgba(0,0,0,0.07);user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;transition:background .12s;border-radius:6px">
+      <div style="display:flex;align-items:baseline;gap:8px">
+        <span style="font-size:12px;color:var(--fg2);min-width:38px">${e.date || '—'}</span>
+        <span style="font-size:13px;color:var(--fg1);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${who}</span>
+        <span style="font-size:14px;font-weight:700;color:${amtColor};white-space:nowrap">${fmtMoney(e.amount)}</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:6px;margin-top:3px;padding-left:46px">
+        ${e.category ? `<span style="font-size:11px;padding:1px 7px;border-radius:99px;background:rgba(0,0,0,0.06);color:var(--fg2);white-space:nowrap">${e.category}</span>` : ''}
+        ${e.note ? `<span style="font-size:11px;color:var(--fg2);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${e.note}</span>` : ''}
+      </div>
+    </div>`;
+  });
+  body.innerHTML = h;
+  attachRecentLongPress();
+}
+
+// 長按（手機 touch ＋ 桌機滑鼠）→ 開啟既有的編輯視窗
+function attachRecentLongPress() {
+  document.querySelectorAll('.recent-row').forEach(row => {
+    let timer = null;
+    const cardKey = row.dataset.card;
+    const rowIdx = parseInt(row.dataset.row, 10);
+    const start = () => {
+      row.style.background = 'rgba(0,0,0,0.06)';
+      timer = setTimeout(() => {
+        timer = null;
+        row.style.background = '';
+        if (navigator.vibrate) { try { navigator.vibrate(30); } catch {} }
+        editEntry(cardKey, rowIdx);
+      }, 550);
+    };
+    const cancel = () => {
+      row.style.background = '';
+      if (timer) { clearTimeout(timer); timer = null; }
+    };
+    row.addEventListener('touchstart', start, { passive: true });
+    row.addEventListener('touchend', cancel);
+    row.addEventListener('touchmove', cancel, { passive: true });
+    row.addEventListener('touchcancel', cancel);
+    row.addEventListener('mousedown', start);
+    row.addEventListener('mouseup', cancel);
+    row.addEventListener('mouseleave', cancel);
+    row.addEventListener('contextmenu', e => e.preventDefault()); // 擋掉長按選字/選單
+  });
+}
+
+// 展開時確保資料已載入；走快取優先，且「不呼叫 renderTab」以免清掉表單
+async function ensureRecentListData() {
+  if (MONTH_LOADED_FOR === CURRENT_MONTH && Object.keys(MONTH_DATA || {}).length) return;
+  const monthKey = CURRENT_MONTH;
+  const cached = cacheGet(`month-${monthKey}`);
+  if (cached && cached.MONTH_DATA && cached.BANK_DATA) {
+    MONTH_DATA = cached.MONTH_DATA;
+    BANK_DATA = cached.BANK_DATA;
+    LAST_STRUCT = cached._struct || null;
+    if (LAST_STRUCT) syncDynamicToGlobals(LAST_STRUCT);
+    MONTH_LOADED_FOR = monthKey;
+    MONTH_DATA_IS_STALE = true;
+    syncBilledStateFrom(monthKey);
+    renderRecentList();
+    // 背景靜默刷新
+    fetchAndParseMonth(monthKey).then(() => {
+      if (CURRENT_MONTH === monthKey && CURRENT_TAB === 'add') renderRecentList();
+    }).catch(e => console.warn('背景刷新失敗', e));
+    return;
+  }
+  try {
+    await fetchAndParseMonth(monthKey);
+    if (CURRENT_MONTH !== monthKey) return;
+    MONTH_LOADED_FOR = monthKey;
+    MONTH_DATA_IS_STALE = false;
+    if (CURRENT_TAB === 'add') renderRecentList();
+  } catch (e) {
+    console.warn('載入最近記錄失敗', e);
+    const body = document.getElementById('recent-body');
+    if (body && !isRecentCollapsed()) {
+      body.innerHTML = `<div style="padding:10px 0;color:var(--fg2);font-size:13px">載入失敗 —
+        <span onclick="ensureRecentListData()" style="color:var(--blue,#2563eb);cursor:pointer">重試</span></div>`;
+    }
+  }
 }
 
 function onInstallmentChange2() {
