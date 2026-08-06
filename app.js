@@ -2,6 +2,14 @@
 // 信用卡記帳 PWA - 主邏輯
 // ─────────────────────────────────────────────────────────────
 // 版本歷史
+// v3.6.1  2026-08-06  修正（小更動）：
+//   - 修正手機 PWA 版本卡住不更新：sw.js 的 skipWaiting()/clients.claim() 只讓新
+//     SW 接管「之後的 fetch」，不會讓已開啟分頁裡跑在記憶體中的舊 app.js 換掉；
+//     手機 PWA 常年不真正 reload（只切背景/前景），所以永遠卡舊版
+//   - 新增 controllerchange 監聽：新 SW 接管控制權時自動 location.reload()
+//   - index.html 的 app.js 版本 query 字串（?v=3.1）長期沒跟著改版同步更新，
+//     改為 ?v=3.6.1，往後每次改版須與 sw.js CACHE_NAME 一起更新
+//
 // v3.6  2026-07-26  修正（中型更動）：
 //   - 修正「最近十筆排序完全失效」：日期欄在試算表是真正的日期格，
 //     effectiveValue 回傳的是序號（例 46226 = 2026-07-23），不是 "M/D" 文字。
@@ -52,7 +60,7 @@
 
 const CLIENT_ID = '144262693536-poq7p69eo0aqr3r0onjafrd2f1rfrmg3.apps.googleusercontent.com';
 const SCOPES = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file';
-const APP_VERSION = 'v3.6';
+const APP_VERSION = 'v3.6.1';
 
 // 9 個銀行（用於儀表板顯示與計算）
 // totalCol = 該銀行總計欄(row 56)；paidCol/accBalCol = 在 row 57 該銀行的「已匯入」「帳戶餘額」位置
@@ -240,6 +248,15 @@ window.addEventListener('load', () => {
     navigator.serviceWorker.register('sw.js')
       .then(r => console.log('SW registered:', r.scope))
       .catch(e => console.warn('SW failed:', e));
+
+    // 新 SW 接管控制權時，強制 reload 才能真正換掉記憶體中執行的舊 app.js
+    // （skipWaiting/clients.claim 只讓新 SW 接手之後的 fetch，不會自動換頁）
+    let swReloaded = false;
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (swReloaded) return;
+      swReloaded = true;
+      window.location.reload();
+    });
   }
 
   // GAPI (for Sheets API)
