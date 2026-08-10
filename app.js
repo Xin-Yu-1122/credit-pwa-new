@@ -2,6 +2,14 @@
 // 信用卡記帳 PWA - 主邏輯
 // ─────────────────────────────────────────────────────────────
 // 版本歷史
+// v3.6.2  2026-08-10  修正（小更動）：
+//   - 修正「記完帳後最近十筆沒即時更新」：saveAddEntry() 只清了 localStorage
+//     快取和 MONTH_LOADED_FOR，從沒呼叫 ensureRecentListData()/renderRecentList()，
+//     刻意避免整頁重繪（連續記帳用）卻漏了刷新清單這一步，導致要切分頁/月份
+//     才會看到剛存的那筆
+//   - 存檔成功後：CURRENT_MONTH 強制重抓，跨月則清 RECENT_XTRA 對應月份快取，
+//     再呼叫 ensureRecentListData() 只刷新清單區塊、不動表單
+//
 // v3.6.1  2026-08-06  修正（小更動）：
 //   - 修正手機 PWA 版本卡住不更新：sw.js 的 skipWaiting()/clients.claim() 只讓新
 //     SW 接管「之後的 fetch」，不會讓已開啟分頁裡跑在記憶體中的舊 app.js 換掉；
@@ -60,7 +68,7 @@
 
 const CLIENT_ID = '144262693536-poq7p69eo0aqr3r0onjafrd2f1rfrmg3.apps.googleusercontent.com';
 const SCOPES = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file';
-const APP_VERSION = 'v3.6.1';
+const APP_VERSION = 'v3.6.2';
 
 // 9 個銀行（用於儀表板顯示與計算）
 // totalCol = 該銀行總計欄(row 56)；paidCol/accBalCol = 在 row 57 該銀行的「已匯入」「帳戶餘額」位置
@@ -1999,11 +2007,14 @@ async function saveAddEntry() {
 
     notify('✓ 已儲存', 'ok');
 
-    // 8) 清除該月份快取（因為資料變了）
+    // 8) 清除該月份快取（因為資料變了），並刷新「最近十筆」清單
     cacheRemove(`month-${targetMonth}`);
     if (targetMonth === CURRENT_MONTH) {
-      MONTH_LOADED_FOR = ''; // 強制下次切過去時重抓
+      MONTH_LOADED_FOR = ''; // 強制重抓
+    } else {
+      delete RECENT_XTRA[targetMonth]; // 強制下次讀「最近十筆」時重新抓這個月
     }
+    if (CURRENT_TAB === 'add') ensureRecentListData();
 
     // 9) 重置表單（保留月份、銀行/卡別）讓快速連續記帳
     document.getElementById('f2-amt').value = '';
