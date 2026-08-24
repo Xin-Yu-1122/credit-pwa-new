@@ -2,6 +2,15 @@
 // 信用卡記帳 PWA - 主邏輯
 // ─────────────────────────────────────────────────────────────
 // 版本歷史
+// v3.6.3  2026-08-24  新增（小更動）：
+//   - 儀表板新增「銀行名冊」比對：動態結構引擎(v3.1)靠第1行文字關鍵字比對
+//     銀行，一旦新分頁漏填/打錯某銀行名稱，該銀行會整個消失且完全不報錯
+//   - 新增 BANK_ROSTER（localStorage 永久記錄，歷史上偵測過的銀行清單），
+//     每次載入月份時累加；儀表板渲染時比對「名冊有、這個月分頁沒有」，
+//     跳出可個別關閉的橘色警示（dismissMissingBank 把該銀行從名冊移除）
+//   - updateBankRoster() 只在 CURRENT_MONTH 的載入流程觸發，避免預抓下個月/
+//     其他月份的背景讀取干擾名冊
+//
 // v3.6.2  2026-08-10  修正（小更動）：
 //   - 修正「記完帳後最近十筆沒即時更新」：saveAddEntry() 只清了 localStorage
 //     快取和 MONTH_LOADED_FOR，從沒呼叫 ensureRecentListData()/renderRecentList()，
@@ -68,7 +77,7 @@
 
 const CLIENT_ID = '144262693536-poq7p69eo0aqr3r0onjafrd2f1rfrmg3.apps.googleusercontent.com';
 const SCOPES = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file';
-const APP_VERSION = 'v3.6.2';
+const APP_VERSION = 'v3.6.3';
 
 // 9 個銀行（用於儀表板顯示與計算）
 // totalCol = 該銀行總計欄(row 56)；paidCol/accBalCol = 在 row 57 該銀行的「已匯入」「帳戶餘額」位置
@@ -212,6 +221,32 @@ const CACHE_TTL = {
   months: 24 * 60 * 60 * 1000, // 月份清單 24h
   monthData: 7 * 24 * 60 * 60 * 1000, // 月份資料 7 天（SWR：用過期的先顯示，背景再更新）
 };
+
+// ─── 銀行名冊（v3.6.3）：記錄歷史上偵測過哪些銀行，用來抓「這個月分頁漏填
+// 第1行銀行名，導致該銀行整個消失卻不報錯」的狀況 ──
+// 名冊只會增加、不會自動變少；使用者按「知道了」才會把某銀行從名冊移除
+const BANK_ROSTER_KEY = 'bank-roster';
+function getBankRoster() { return cacheGet(BANK_ROSTER_KEY) || []; } // [{key,name}]
+function updateBankRoster(struct) {
+  if (!struct || !struct.banks) return;
+  const roster = getBankRoster();
+  const known = new Set(roster.map(r => r.key));
+  let changed = false;
+  struct.banks.forEach(b => {
+    if (!known.has(b.key)) {
+      const canon = BANK_NAME_KEYS.find(k => k.key === b.key);
+      roster.push({ key: b.key, name: canon ? canon.match[0] : b.name });
+      known.add(b.key);
+      changed = true;
+    }
+  });
+  if (changed) cacheSet(BANK_ROSTER_KEY, roster, Infinity);
+}
+function dismissMissingBank(bankKey) {
+  const roster = getBankRoster().filter(r => r.key !== bankKey);
+  cacheSet(BANK_ROSTER_KEY, roster, Infinity);
+  renderTab();
+}
 
 function todayYYMM() {
   const d = new Date();
@@ -1005,6 +1040,7 @@ async function fetchAndParseMonth(monthKey) {
     // ── v3.1 動態解析（一律新格式，不再做新舊偵測）──
     const detected = detectStructure(rowsFull);
     LAST_STRUCT = detected;
+    if (monthKey === CURRENT_MONTH) updateBankRoster(detected);
     parseMonthDataDynamic(rowsFull, bgsFull, detected, monthKey);
     syncBilledStateFrom(monthKey);
 
@@ -2131,6 +2167,16 @@ function renderDashboard() {
   h += `<div class="kpi-card"><div class="kpi-label">本月分期</div><div class="kpi-value orange">${fmtMoney(gInstall)}</div></div>`;
   h += `</div>`;
   h += `<div class="card"><div class="card-title">預計餘額</div><div class="card-value ${gAccBalTotal < 0 ? 'red' : ''}">${fmtMoney(gAccBalTotal)}</div><div class="card-sub">${gAccBalTotal < 0 ? '⚠ 透支' : '可用餘額'}</div></div>`;
+
+  // 銀行名冊比對：抓「這個月分頁漏填第1行銀行名，導致銀行整個消失卻不報錯」的狀況
+  const detectedKeys = new Set((LAST_STRUCT?.banks || []).map(b => b.key));
+  const missingBanks = getBankRoster().filter(r => !detectedKeys.has(r.key));
+  if (missingBanks.length) {
+    h += `<div style="margin:0 0 12px;padding:10px 12px;background:rgba(255,153,0,0.1);border:1px solid rgba(255,153,0,0.5);border-radius:8px;font-size:13px;color:var(--fg1,#222);line-height:1.5">
+      ⚠ 這個月分頁偵測不到：<b>${missingBanks.map(m => escapeHtml(m.name)).join('、')}</b>，可能是第 1 行銀行名漏填或打錯，該銀行暫時不會顯示在下方摘要
+      ${missingBanks.map(m => `<button onclick="dismissMissingBank('${m.key}')" style="display:inline-block;margin-top:6px;margin-right:6px;border:none;background:rgba(0,0,0,0.08);color:var(--fg2,#555);cursor:pointer;font-size:12px;padding:4px 10px;border-radius:6px">知道了，不再提醒「${escapeHtml(m.name)}」</button>`).join('')}
+    </div>`;
+  }
 
   // 各銀行摘要 - 標題列 + 重新整理按鈕
   h += `<div class="section-head">
