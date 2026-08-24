@@ -2,6 +2,13 @@
 // 信用卡記帳 PWA - 主邏輯
 // ─────────────────────────────────────────────────────────────
 // 版本歷史
+// v3.6.4  2026-08-24  修正（小更動）：
+//   - 修正 v3.6.3 銀行名冊的 bootstrap 漏洞：名冊原本從空陣列開始，只在偵測到
+//     「完整」的月份時才學到某銀行存在過；若部署後第一次打開的月份剛好就是
+//     缺漏的那個月，名冊永遠學不到，警示永遠不會跳
+//   - getBankRoster() 改為第一次呼叫時用 BANK_NAME_KEYS（程式內建的固定銀行
+//     清單）當初始名冊，不用再依賴「剛好遇到齊全的月份」
+//
 // v3.6.3  2026-08-24  新增（小更動）：
 //   - 儀表板新增「銀行名冊」比對：動態結構引擎(v3.1)靠第1行文字關鍵字比對
 //     銀行，一旦新分頁漏填/打錯某銀行名稱，該銀行會整個消失且完全不報錯
@@ -77,7 +84,7 @@
 
 const CLIENT_ID = '144262693536-poq7p69eo0aqr3r0onjafrd2f1rfrmg3.apps.googleusercontent.com';
 const SCOPES = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file';
-const APP_VERSION = 'v3.6.3';
+const APP_VERSION = 'v3.6.4';
 
 // 9 個銀行（用於儀表板顯示與計算）
 // totalCol = 該銀行總計欄(row 56)；paidCol/accBalCol = 在 row 57 該銀行的「已匯入」「帳戶餘額」位置
@@ -226,7 +233,16 @@ const CACHE_TTL = {
 // 第1行銀行名，導致該銀行整個消失卻不報錯」的狀況 ──
 // 名冊只會增加、不會自動變少；使用者按「知道了」才會把某銀行從名冊移除
 const BANK_ROSTER_KEY = 'bank-roster';
-function getBankRoster() { return cacheGet(BANK_ROSTER_KEY) || []; } // [{key,name}]
+function getBankRoster() {
+  const cached = cacheGet(BANK_ROSTER_KEY);
+  if (cached) return cached; // [{key,name}]
+  // 第一次啟用：用程式內建的固定銀行清單當初始名冊，不用等剛好偵測到完整的
+  // 一個月才學到「這些銀行存在過」——否則若部署當下打開的月份剛好就是缺漏的
+  // 那個月，名冊永遠學不到，警示永遠不會跳
+  const seeded = BANK_NAME_KEYS.map(k => ({ key: k.key, name: k.match[0] }));
+  cacheSet(BANK_ROSTER_KEY, seeded, Infinity);
+  return seeded;
+}
 function updateBankRoster(struct) {
   if (!struct || !struct.banks) return;
   const roster = getBankRoster();
