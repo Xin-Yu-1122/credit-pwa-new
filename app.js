@@ -2,6 +2,13 @@
 // 信用卡記帳 PWA - 主邏輯
 // ─────────────────────────────────────────────────────────────
 // 版本歷史
+// v3.6.5  2026-08-24  修改（小更動）：
+//   - 儀表板「各銀行摘要」移除零值自動隱藏：原本消費總計/分期/抵扣回饋/
+//     已匯入/待繳/帳戶餘額全部為0時該銀行卡片會整個不顯示（防雜亂設計），
+//     實際排查發現富邦、永豐「消失」是這個機制，不是資料或結構有問題
+//   - 使用者要求改為所有銀行卡片一律顯示，即使這個月完全零消費零餘額，
+//     方便一眼看出哪些卡這個月沒用到，不用去猜是隱藏還是資料漏掉
+//
 // v3.6.4  2026-08-24  修正（小更動）：
 //   - 修正 v3.6.3 銀行名冊的 bootstrap 漏洞：名冊原本從空陣列開始，只在偵測到
 //     「完整」的月份時才學到某銀行存在過；若部署後第一次打開的月份剛好就是
@@ -84,7 +91,7 @@
 
 const CLIENT_ID = '144262693536-poq7p69eo0aqr3r0onjafrd2f1rfrmg3.apps.googleusercontent.com';
 const SCOPES = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file';
-const APP_VERSION = 'v3.6.4';
+const APP_VERSION = 'v3.6.5';
 
 // 9 個銀行（用於儀表板顯示與計算）
 // totalCol = 該銀行總計欄(row 56)；paidCol/accBalCol = 在 row 57 該銀行的「已匯入」「帳戶餘額」位置
@@ -2205,8 +2212,6 @@ function renderDashboard() {
     const bd = BANK_DATA[b.key];
     if (!bd) return;
     if (b.isCash) {
-      // 現金卡：有總計或現金值才顯示
-      if (bd.total === 0 && bd.accBal === 0) return;
       h += `<div class="card-row">
         <div class="bank-head">
           <div class="bank-name">${b.name}</div>
@@ -2216,7 +2221,6 @@ function renderDashboard() {
         <div class="bank-line"><span>目前現金</span><span class="v green">${fmtMoney(bd.accBal)}</span></div>
       </div>`;
     } else {
-      if (bd.total === 0 && bd.paid === 0 && bd.install === 0 && bd.rebate === 0 && bd.pending === 0 && bd.accBal === 0) return;
       const isPaid = bd.isPaidCheck;
       h += `<div class="card-row ${isPaid?'paid':''}">
         <div class="paid-badge">✓ 已繳</div>
