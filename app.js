@@ -2,6 +2,12 @@
 // 信用卡記帳 PWA - 主邏輯
 // ─────────────────────────────────────────────────────────────
 // 版本歷史
+// v3.6.6  2026-10-13  修正（小更動）：
+//   - 修正「三不五時被要求重新登入」：原本 refresh 只要失敗一次（手機剛開網路還沒連上、
+//     Worker 暫時沒回應）就 clearTokens() 刪掉 refresh token，只能重新登入
+//   - refreshAccessToken() 失敗時標記 tokenRevoked（只有 Google 回 invalid_grant 才為 true），
+//     boot() 與 retryWithAuth() 只在 tokenRevoked 時才清憑證回登入頁，其餘保留下次再試
+//
 // v3.6.5  2026-08-24  修改（小更動）：
 //   - 儀表板「各銀行摘要」移除零值自動隱藏：原本消費總計/分期/抵扣回饋/
 //     已匯入/待繳/帳戶餘額全部為0時該銀行卡片會整個不顯示（防雜亂設計），
@@ -91,7 +97,7 @@
 
 const CLIENT_ID = '144262693536-poq7p69eo0aqr3r0onjafrd2f1rfrmg3.apps.googleusercontent.com';
 const SCOPES = 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file';
-const APP_VERSION = 'v3.6.5';
+const APP_VERSION = 'v3.6.6';
 
 // 9 個銀行（用於儀表板顯示與計算）
 // totalCol = 該銀行總計欄(row 56)；paidCol/accBalCol = 在 row 57 該銀行的「已匯入」「帳戶餘額」位置
@@ -364,10 +370,15 @@ function boot() {
     refreshAccessToken().then(() => {
       enterApp();
     }).catch((e) => {
-      console.warn('自動續期失敗，需重新登入', e);
-      // refresh token 失效（極少發生）才需要重新登入
-      clearTokens();
-      showLogin();
+      console.warn('自動續期失敗', e);
+      if (e?.tokenRevoked) {
+        // refresh token 真的作廢才需要重新登入
+        clearTokens();
+        showLogin();
+      } else {
+        // 暫時性錯誤（網路未連上等）：保留 refresh token，先進 App，之後 API 呼叫會再自動續期
+        enterApp();
+      }
     });
   } else {
     // 完全沒有憑證 → 首次登入
@@ -483,9 +494,13 @@ async function refreshAccessToken() {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({refresh_token: refreshTok}),
   });
-  const tok = await resp.json();
+  const tok = await resp.json().catch(() => ({}));
   if (tok.error || !tok.access_token) {
-    throw new Error(tok.error_description || tok.error || 'refresh 失敗');
+    const err = new Error(tok.error_description || tok.error || 'refresh 失敗');
+    // 只有 Google 明確回 invalid_grant（refresh token 已作廢）才算真的要重新登入；
+    // 網路斷線、Worker 暫時錯誤等都保留 refresh token，下次再試
+    err.tokenRevoked = tok.error === 'invalid_grant';
+    throw err;
   }
   saveTokens(tok);
   gapi.client.setToken({access_token: TOKEN});
@@ -1403,9 +1418,11 @@ async function retryWithAuth(fn) {
         await refreshAccessToken();
         return await fn();
       } catch (e2) {
-        // refresh token 也失效（極少）→ 才需要重新登入
-        clearTokens();
-        showLogin();
+        // refresh token 真的作廢才需要重新登入；暫時性錯誤保留憑證，只把錯誤往上拋
+        if (e2?.tokenRevoked) {
+          clearTokens();
+          showLogin();
+        }
         throw e2;
       }
     }
